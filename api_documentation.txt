@@ -1,0 +1,292 @@
+================================================================================
+        FOCUS SWIFTBILL POS - API ENDPOINTS REFERENCE
+        Base URL: http://localhost/focus8API/ (Configurable)
+        All requests require header: fSessionId (except Login)
+================================================================================
+
+CONTENTS
+1. Authentication & Session
+2. Company Methods
+3. Master Data (Products, Accounts/Customers, Units)
+4. Transaction Methods (Sales Orders - Billing Core)
+5. Approval & Authorization
+6. Reports
+7. Utility Methods
+
+================================================================================
+1. AUTHENTICATION & SESSION
+================================================================================
+
+**POST /Login**
+   Description: Authenticates user and returns a session ID (fSessionId) which must be sent in all subsequent requests.
+   Request Body:
+   {
+     "data": [
+       {
+         "Username": "su",
+         "password": "su",
+         "CompanyId": "36"
+       }
+     ],
+     "result": 1,
+     "message": ""
+   }
+   Response (success):
+   {
+     "url": "http://localhost/focus8API/Login",
+     "data": [ { "fSessionId": "0410201810859809361" } ],
+     "result": 1,
+     "message": ""
+   }
+   Note: fSessionId is stored securely (flutter_secure_storage) and automatically injected into headers.
+
+================================================================================
+2. COMPANY METHODS
+================================================================================
+
+**GET /List/Company**
+   Description: Get list of all companies. Used on login screen after base URL is entered.
+   Response: Array of { "Company_Id", "Company_Name", "Company_Code" }
+
+**GET /List/Company/CompanyDetails?where=CompanyId={id}**
+   Description: Get details of a specific company (accounting date, etc.)
+   Response: { "CompanyAccountingDate", "CompanyId", "CompanyName", "CompanyCode" }
+
+**GET /List/Company/SupportedLanguage?where=CompanyId={id}**
+   Description: Get supported languages for the company (optional, may be used for localization).
+
+================================================================================
+3. MASTER DATA (Products, Customers, Accounts, Units)
+================================================================================
+
+3.1 List Masters (Types)
+**GET /List/Masters**
+   Description: Lists all master types available in the system.
+   Response: [ { "Caption": "Account", "API MasterName": "Core_Account" }, ... ]
+
+3.2 Products (Core_Product)
+**GET /List/Masters/Core_Product**
+   Description: Get paginated list of all products with all fields.
+   Supports query parameters: ?fields=...&where=...
+
+**GET /Screen/Masters/Core_Product/{code}**
+   Description: Get complete product details for a specific product code (e.g., "Product1").
+   Response includes all fields: name, code, unit, tax info, etc.
+
+**GET /Screen/CoreMasters/Products**
+   Description: Simplified product list (ID, Name). Used for quick lookups.
+   Response: [ { "Id": 25190, "Name": "Product Name" }, ... ]
+
+3.3 Accounts / Customers (Core_Account)
+**GET /List/Masters/Core_Account**
+   Description: List all accounts (customers, suppliers, etc.) with all fields.
+
+**GET /Screen/Masters/Core_Account/{code}**
+   Description: Get full details of a specific account by its code (e.g., "122-001" for a customer).
+
+3.4 Units
+**GET /Screen/CoreMasters/Units**
+   Description: List of available units (PC, Box, KG, etc.).
+   Response: [ { "ID": 1, "Name": "PC" }, ... ]
+
+================================================================================
+4. TRANSACTION METHODS (SALES ORDERS - BILLING)
+================================================================================
+
+4.1 List Sales Orders
+**GET /List/Transactions/Sales Orders?pageNo=0&NoOfRows=50**
+   Description: Paginated list of sales orders. Used for order history screen.
+   Optional query: &where=uniqueid=...&IsNextPage=true
+   Response includes voucher number, date, auth status, created by, etc.
+
+4.2 Get Single Sales Order (Full Details)
+**GET /Screen/Transactions/Sales Orders/{voucherNo}**
+   Description: Retrieves complete sales order with header, body (line items), and footer.
+   Example: /Screen/Transactions/Sales%20Orders/1
+   Response structure: { "Header": { "DocNo", "Date", "CustomerAC__Code", ... }, 
+                         "Body": [ { "Product__Code", "Quantity", "Rate", "Gross", ... } ],
+                         "Footer": [ ... ] }
+
+4.3 Create / Update Sales Order
+**POST /Transactions/Sales Orders**
+   Description: Post a new sales order (billing transaction). Used when saving a bill.
+   Request Body Format:
+   {
+     "data": [
+       {
+         "Header": {
+           "Date": "132252591",     // OLE Automation date (integer)
+           "CustomerAC__Code": "122-001",
+           "CustomerAC__Name": "Customer A",
+           "sNarration": "Optional note"
+         },
+         "Body": [
+           {
+             "Product__Code": "Product1",
+             "Quantity": "10",
+             "Rate": "1",
+             "Gross": "10"
+           }
+         ]
+       }
+     ]
+   }
+   Response: { "HeaderId": 0, "VoucherNo": "1", "BodyIds": [...], "Posted": true }
+
+4.4 Delete Sales Order
+**DELETE /Transactions/Sales Orders/{voucherNo}**
+   Description: Deletes a sales order by voucher number.
+
+4.5 New Voucher Number Generation
+**POST /Transactions/NewVoucherNumber**
+   Description: Get next available voucher number for a voucher type.
+   Request: { "data": [ { "VoucherType": "Sales Orders" } ] }
+   Response: { "NewVoucherNumber": "3" }
+
+4.6 Pending Bills / Held Orders
+   Note: The app uses local Hive storage (`pending_bills`, `held_orders`) for offline pending bills.
+   No specific API endpoint is documented for "pending" status – sales orders can have status "Suspended" or "AuthStatus": "Pending".
+   Filtering list with `?where=Suspended=True` may be used.
+
+================================================================================
+5. APPROVAL & AUTHORIZATION
+================================================================================
+
+**GET /Screen/Transactions/AlertApprovalCount**
+   Description: Gets count of pending alerts and approvals for the logged-in user.
+   Response: { "AlertsCount": 1, "ApprovalsCount": 0 }
+
+**GET /Screen/Transactions/Approvals**
+   Description: List of pending approvals grouped by voucher type.
+   Response: [ { "ModuleId":1, "ScreenId":5632, "AlertPurpose":"Authorization", "Count":"3", "ScreenName":"Sales Orders" } ]
+
+**GET /Screen/Transactions/Approvals/{screenId}**
+   Description: Detailed approval list for a specific voucher type (e.g., 5632 for Sales Orders).
+   Example: /Screen/Transactions/Approvals/5632
+   Response includes each voucher needing approval with its code, date, message.
+
+**GET /Screen/Transactions/Approvals/{screenId}/{recordId}**
+   Description: Get details of a specific approval request (e.g., document no, date, party, amount).
+
+**POST /Screen/Transactions/AuthorizeVouchers/{voucherName}/{voucherNo}**
+   Description: Authorize a voucher (approve).
+   Example: /Screen/Transactions/AuthorizeVouchers/Sales%20Orders/1
+   Response: { "result": 1, "message": "Voucher has been Authorized" }
+
+**POST /Screen/Transactions/RejectVouchers/{voucherName}/{voucherNo}**
+   Description: Reject a voucher.
+
+**POST /Screen/Transactions/StopVouchers/{voucherName}/{voucherNo}**
+   Description: Stop a voucher.
+
+================================================================================
+6. REPORTS
+================================================================================
+
+**POST /Reports/pagedata**
+   Description: Fetch report data (e.g., sales summary, order details). Used in Dashboard.
+   Request Body includes:
+   - ReportId (e.g., "551")
+   - StartingDate / EndingDate (OLE date integers)
+   - LayoutId, RowsPerPage, CurrentPage
+   - Inputs (array of { id, value })
+   - Masters (array of { id, name })
+   - UniqueId (guid for session)
+   Response: { "ColumnData": [...], "Columns": [...], "TotalRow": 0, "EndOfFile": true }
+
+**GET /List/Reports**
+   Description: List all available reports (for report selection screen).
+
+**GET /Screen/Reports/ReportLayouts/{reportName}/{layoutId}**
+   Description: Get available layouts for a report.
+
+================================================================================
+7. UTILITY METHODS
+================================================================================
+
+**GET /utility/preferences**
+   Description: Get all preference categories (e.g., Tag, Accounts).
+   Response: [ { "Id": 0, "Name": "Tag", "Description": "Tag" }, ... ]
+
+**GET /utility/preferences/{category}**
+   Description: Get subcategories for a category (e.g., /utility/preferences/Tag returns Inventory, Accounts, Payroll).
+
+**GET /utility/preferences/{category}/{subcategory}**
+   Description: Get preference value. Example: /utility/preferences/Tag/Inventory returns { "Value": 4 }
+
+**GET /utility/companycodefromid/{companyId}**
+   Description: Convert company ID to company code. Example: /utility/companycodefromid/36 returns "010".
+
+**GET /utility/companyidfromcode/{companyCode}**
+   Description: Convert company code to ID.
+
+**GET /utility/nextno/{currentNumber}**
+   Description: Get next numeric sequence. Example: /utility/nextno/1 returns "2".
+
+**GET /utility/nextlongno/{currentNumber}**
+   Description: For alphanumeric sequences (e.g., LC_1 -> LC_2).
+
+**GET /utility/prevno/{currentNumber}**
+   Description: Get previous number.
+
+**GET /utility/ModuleAbbreviation/{moduleName}**
+   Description: Get module abbreviation (e.g., Payroll -> "cPay").
+
+**GET /utility/isitsales/{voucherType}**
+   Description: Check if voucher type is a sales voucher. Example: /utility/isitsales/Sales%20Orders returns true.
+
+**GET /utility/isitnegative/{voucherType}**
+   Description: Check if voucher type is negative (returns false for Sales Orders).
+
+**GET /utility/isitwms/{voucherType}**
+   Description: Check if WMS enabled for voucher type.
+
+**GET /utility/roundoff/{value}/{decimals}/{direction}**
+   Description: Round off a value. Direction: "Up", "Down". Example: /utility/roundoff/100/1/Up
+
+**GET /utility/translatewholenumber/{number}**
+   Description: Convert number to words. Example: /utility/translatewholenumber/562 returns "Five Hundred Sixty Two".
+
+**POST /utility/SavePreferences**
+   Description: Save user preferences (e.g., UI settings, default values).
+
+================================================================================
+NOTES ON DATA FORMATS
+================================================================================
+
+- Dates are typically OLE Automation date integers (e.g., 132252938). Convert using standard OLE date conversion.
+- Amounts are decimal strings with up to 4 decimal places (e.g., "100.0000").
+- Response wrapper always contains: "url", "data" (array or object), "result" (1=success, 0=failure), "message".
+- Headers: All requests after login must include "fSessionId: {sessionId}" and "Content-Type: application/json" for POST/PUT.
+- Error handling: If `result` is 0, check `message` for error description.
+
+================================================================================
+ERROR CODES (from documentation examples)
+================================================================================
+
+- result = 1 : Success
+- result = 0 : Failure (e.g., invalid login, missing data, server error)
+- Common messages:
+  - "Voucher has been Authorized"
+  - "Record Deleted Successfully"
+  - "Master Saved Successfully"
+  - "Physical Stock, Excess Stock, Shortage Stock Vouchers Posted Successfully"
+
+================================================================================
+INTEGRATION WITH APP'S LOCAL STORAGE
+================================================================================
+
+The Focus SwiftBill POS app uses Hive for offline-first operation. APIs are called
+when connectivity is available to sync:
+- Login and company selection (always online)
+- Fetch product master data (cached locally)
+- Fetch customer/account data
+- Create sales orders (bills) - both local save + server post
+- Fetch order history
+- Process approvals
+
+Pending bills are stored locally in `pending_bills` Hive box and synced when online.
+
+================================================================================
+END OF API REFERENCE
+================================================================================

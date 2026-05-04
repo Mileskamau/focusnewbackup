@@ -1,0 +1,15 @@
+targets:
+  $default:
+    sources:
+      - lib/**
+      - assets/**
+    builders:
+      json_serializable:
+        options:
+          explicit_to_json: true
+          any_map: false
+          checked: true
+        generate_for:
+          - lib/models/api_models.dart
+      source_gen:combining_builder:
+        enabled: true

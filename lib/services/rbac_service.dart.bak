@@ -1,0 +1,37 @@
+import 'package:focus/utils/constants.dart';
+
+class RbacService {
+  static String getStoreName() {
+    return '';
+  }
+
+  static bool canViewReports(String role) {
+    return role == AppConstants.roleManager;
+  }
+
+  static bool canCancelOrder(String role) {
+    return role == AppConstants.roleManager || role == AppConstants.roleCashier;
+  }
+
+  static bool canRefund(String role) {
+    return role == AppConstants.roleManager;
+  }
+
+  static bool canManageCashiers(String role) {
+    return role == AppConstants.roleManager;
+  }
+
+  static bool canApplyDiscount(String role, [double maxPercent = 0]) {
+    if (role == AppConstants.roleManager) {
+      return true;
+    }
+    if (role == AppConstants.roleCashier) {
+      return maxPercent <= 10.0;
+    }
+    return false;
+  }
+
+  static bool canViewFullDashboard(String role) {
+    return role == AppConstants.roleManager;
+  }
+}
