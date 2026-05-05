@@ -14,6 +14,11 @@ class ProductSyncResult {
   final bool usedRemoteData;
 }
 
+enum ProductCatalogSource {
+  defaultCatalog,
+  sellerPriceBook,
+}
+
 class ProductSyncService {
   ProductSyncService._internal();
 
@@ -21,16 +26,18 @@ class ProductSyncService {
   factory ProductSyncService() => _instance;
 
   static const String _lastProductsSyncKey = 'products_last_sync_at';
+  static const String _lastSellerPriceBookSyncKey = 'seller_price_book_last_sync_at';
   static const Duration syncInterval = Duration(hours: 6);
   static const int pageSize = 20;
 
   Future<ProductSyncResult> ensureProductsLoaded({
     bool forceRefresh = false,
+    ProductCatalogSource source = ProductCatalogSource.defaultCatalog,
   }) async {
     final productsBox = DatabaseService.getProducts();
     final shouldRefresh = forceRefresh ||
         productsBox.isEmpty ||
-        await _isSyncDue();
+        await _isSyncDue(_syncKeyFor(source));
 
     if (!shouldRefresh) {
       return ProductSyncResult(
@@ -40,12 +47,14 @@ class ProductSyncService {
     }
 
     try {
-      final rawProducts = await ApiService().getProducts();
+      final rawProducts = source == ProductCatalogSource.sellerPriceBook
+          ? await ApiService().getSellerPriceBookProducts()
+          : await ApiService().getProducts();
       final products = _mapProducts(rawProducts);
 
       if (products.isNotEmpty) {
         await DatabaseService.replaceProducts(products);
-        await _setLastSyncTime(DateTime.now());
+        await _setLastSyncTime(_syncKeyFor(source), DateTime.now());
         return ProductSyncResult(
           productCount: products.length,
           usedRemoteData: true,
@@ -76,9 +85,15 @@ class ProductSyncService {
     }
   }
 
-  Future<bool> _isSyncDue() async {
+  String _syncKeyFor(ProductCatalogSource source) {
+    return source == ProductCatalogSource.sellerPriceBook
+        ? _lastSellerPriceBookSyncKey
+        : _lastProductsSyncKey;
+  }
+
+  Future<bool> _isSyncDue(String key) async {
     final prefs = await SharedPreferences.getInstance();
-    final raw = prefs.getString(_lastProductsSyncKey);
+    final raw = prefs.getString(key);
     if (raw == null || raw.isEmpty) {
       return true;
     }
@@ -91,9 +106,9 @@ class ProductSyncService {
     return DateTime.now().difference(lastSyncTime) >= syncInterval;
   }
 
-  Future<void> _setLastSyncTime(DateTime time) async {
+  Future<void> _setLastSyncTime(String key, DateTime time) async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_lastProductsSyncKey, time.toIso8601String());
+    await prefs.setString(key, time.toIso8601String());
   }
 
   List<Product> _mapProducts(List<dynamic> rawProducts) {

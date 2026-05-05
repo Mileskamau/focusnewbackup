@@ -1,6 +1,7 @@
 import 'dart:async';
-import 'dart:convert';
 
+import 'package:connectivity_plus/connectivity_plus.dart';
+import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:focus_swiftbill/services/api_service.dart';
 import 'package:focus_swiftbill/services/auth_service.dart';
@@ -18,63 +19,64 @@ class LoginScreen extends StatefulWidget {
 }
 
 class _LoginScreenState extends State<LoginScreen> {
-  static const String _baseUrlHistoryKey = 'api_base_url_history';
-  static const String _companyCacheKey = 'company_cache_by_base_url';
   static const String _companyIdKey = 'selected_company_id';
   static const String _companyNameKey = 'selected_company_name';
   static const String _companyCodeKey = 'selected_company_code';
 
   final TextEditingController usernameController = TextEditingController();
   final TextEditingController passwordController = TextEditingController();
-  final TextEditingController _baseUrlController = TextEditingController();
-  final TextEditingController _adminUserController = TextEditingController();
-  final TextEditingController _adminPassController = TextEditingController();
-  final GlobalKey<FormState> _adminFormKey = GlobalKey<FormState>();
-  Timer? _baseUrlDebounce;
-  bool rememberMe = false;
+  final Dio _loginLookupDio = Dio(
+    BaseOptions(
+      connectTimeout: const Duration(seconds: 12),
+      receiveTimeout: const Duration(seconds: 12),
+      headers: const {
+        'Accept': 'application/json',
+      },
+    ),
+  );
   bool _isLoading = false;
-  bool _isLoadingCompanies = false;
+  bool _isLoadingSetup = true;
+  bool _isLoadingOutletMappings = false;
   String? _errorMessage;
+  String? _outletMappingMessage;
+  Timer? _usernameLookupDebounce;
 
   String? selectedOutlet;
   String? selectedCashier;
-  _CompanyOption? _selectedCompany;
-  final List<String> outlets = ['PAPA PILLAYR'];
-  final List<String> counter = ['PPS COUNTER 1'];
-  final List<String> counter2 = ['Cashier 1', 'Cashier 2'];
-  List<_CompanyOption> _companies = const [];
-  String _activeBaseUrl = '';
-  int _companyLoadRequestId = 0;
+  List<String> outlets = [];
+  List<String> counter = [];
+  List<_OutletCounterMapping> _outletMappings = [];
+  String _configuredBaseUrl = '';
+  String _configuredCompanyName = '';
+  String _configuredCompanyCode = '';
 
   @override
   void initState() {
     super.initState();
-    _initializeLoginConfiguration();
+    usernameController.addListener(_onUsernameChanged);
+    _loadSavedConfiguration();
   }
 
-  Future<void> _initializeLoginConfiguration() async {
+  Future<void> _loadSavedConfiguration() async {
     final prefs = await SharedPreferences.getInstance();
     final savedBaseUrl = _normalizeBaseUrl(await ApiService().getSavedBaseUrl());
-    final selectedCompanyId = prefs.getString(_companyIdKey);
-
-    _activeBaseUrl = savedBaseUrl;
-    _baseUrlController.text = savedBaseUrl;
-
-    if (selectedCompanyId != null) {
-      final savedCompanyName = prefs.getString(_companyNameKey) ?? '';
-      final savedCompanyCode = prefs.getString(_companyCodeKey) ?? '';
-      _selectedCompany = _CompanyOption(
-        id: selectedCompanyId,
-        name: savedCompanyName,
-        code: savedCompanyCode,
-      );
-    }
-
-    if (mounted) {
-      setState(() {});
-    }
-
-    await _loadCompanies();
+    final savedCredentials = await AuthService().getSavedLoginCredentials();
+    if (!mounted) return;
+    setState(() {
+      _configuredBaseUrl = savedBaseUrl;
+      _configuredCompanyName = prefs.getString(_companyNameKey)?.trim() ?? '';
+      _configuredCompanyCode = prefs.getString(_companyCodeKey)?.trim() ?? '';
+      _isLoadingSetup = false;
+      if (savedCredentials != null) {
+        if (usernameController.text.trim().isEmpty) {
+          usernameController.text = savedCredentials.username;
+        }
+        if (passwordController.text.isEmpty) {
+          passwordController.text = savedCredentials.password;
+        }
+      }
+    });
+    _scheduleOutletLookup();
   }
 
   String _normalizeBaseUrl(String value) {
@@ -85,222 +87,214 @@ class _LoginScreenState extends State<LoginScreen> {
     return normalized;
   }
 
-  Future<void> _saveBaseUrlHistory(String baseUrl) async {
-    final prefs = await SharedPreferences.getInstance();
-    final history = prefs.getStringList(_baseUrlHistoryKey) ?? <String>[];
-    history.removeWhere((item) => item == baseUrl);
-    history.insert(0, baseUrl);
-    if (history.length > 20) {
-      history.removeRange(20, history.length);
-    }
-    await prefs.setStringList(_baseUrlHistoryKey, history);
+  Future<void> _openSetupScreen() async {
+    await Navigator.pushNamed(context, '/settings');
+    await _loadSavedConfiguration();
   }
 
-  Future<void> _cacheCompaniesForBaseUrl(
-    String baseUrl,
-    List<_CompanyOption> companies,
-  ) async {
-    final prefs = await SharedPreferences.getInstance();
-    final rawCache = prefs.getString(_companyCacheKey);
-    Map<String, dynamic> cache = <String, dynamic>{};
-
-    if (rawCache != null && rawCache.isNotEmpty) {
-      try {
-        cache = Map<String, dynamic>.from(jsonDecode(rawCache) as Map);
-      } catch (_) {
-        cache = <String, dynamic>{};
-      }
+  void _onUsernameChanged() {
+    if (mounted) {
+      setState(() {
+        _outletMappings = [];
+        outlets = [];
+        counter = [];
+        selectedOutlet = null;
+        selectedCashier = null;
+        _outletMappingMessage = usernameController.text.trim().isEmpty
+            ? null
+            : 'Checking outlet access...';
+      });
     }
-
-    cache[baseUrl] = companies.map((company) => company.toMap()).toList();
-    await prefs.setString(_companyCacheKey, jsonEncode(cache));
+    _scheduleOutletLookup();
   }
 
-  Future<List<_CompanyOption>> _getCachedCompaniesForBaseUrl(String baseUrl) async {
-    final prefs = await SharedPreferences.getInstance();
-    final rawCache = prefs.getString(_companyCacheKey);
-    if (rawCache == null || rawCache.isEmpty) {
-      return const [];
-    }
-
-    try {
-      final cache = Map<String, dynamic>.from(jsonDecode(rawCache) as Map);
-      final cachedCompanies = cache[baseUrl];
-      if (cachedCompanies is! List) {
-        return const [];
-      }
-
-      return cachedCompanies
-          .map((item) => _CompanyOption.fromMap(Map<String, dynamic>.from(item as Map)))
-          .toList();
-    } catch (_) {
-      return const [];
-    }
-  }
-
-  Future<void> _loadCompanies({String? baseUrl}) async {
-    final targetBaseUrl = _normalizeBaseUrl(baseUrl ?? _baseUrlController.text);
-    if (targetBaseUrl.isEmpty) {
-      if (!mounted) return;
-      setState(() {
-        _companies = const [];
-        _selectedCompany = null;
-        _isLoadingCompanies = false;
-        _errorMessage = null;
-      });
-      return;
-    }
-
-    final requestId = ++_companyLoadRequestId;
-    setState(() {
-      _isLoadingCompanies = true;
-      _errorMessage = null;
-    });
-
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      final selectedCompanyId = prefs.getString(_companyIdKey);
-      await ApiService().setBaseUrl(targetBaseUrl);
-      final companies = (await ApiService().getCompanies())
-          .map((item) => _CompanyOption.fromMap(Map<String, dynamic>.from(item as Map)))
-          .toList()
-        ..sort((a, b) => a.name.compareTo(b.name));
-      await _cacheCompaniesForBaseUrl(targetBaseUrl, companies);
-
-      _CompanyOption? matchedCompany = _selectedCompany;
-      if (selectedCompanyId != null) {
-        for (final company in companies) {
-          if (company.id == selectedCompanyId) {
-            matchedCompany = company;
-            break;
-          }
-        }
-      }
-
-      if (!mounted || requestId != _companyLoadRequestId) return;
-      setState(() {
-        _companies = companies;
-        _selectedCompany = matchedCompany;
-        _isLoadingCompanies = false;
-        _errorMessage = null;
-        _activeBaseUrl = targetBaseUrl;
-      });
-    } on ApiException catch (e) {
-      final cachedCompanies = await _getCachedCompaniesForBaseUrl(targetBaseUrl);
-      if (!mounted || requestId != _companyLoadRequestId) return;
-      if (cachedCompanies.isNotEmpty) {
-        setState(() {
-          _companies = cachedCompanies;
-          _selectedCompany = cachedCompanies.any(
-                  (company) => company.id == _selectedCompany?.id)
-              ? _selectedCompany
-              : null;
-          _isLoadingCompanies = false;
-          _errorMessage = null;
-          _activeBaseUrl = targetBaseUrl;
-        });
-        return;
-      }
-
-      setState(() {
-        _companies = const [];
-        _isLoadingCompanies = false;
-        _errorMessage = e.message;
-      });
-    } catch (_) {
-      final cachedCompanies = await _getCachedCompaniesForBaseUrl(targetBaseUrl);
-      if (!mounted || requestId != _companyLoadRequestId) return;
-      if (cachedCompanies.isNotEmpty) {
-        setState(() {
-          _companies = cachedCompanies;
-          _selectedCompany = cachedCompanies.any(
-                  (company) => company.id == _selectedCompany?.id)
-              ? _selectedCompany
-              : null;
-          _isLoadingCompanies = false;
-          _errorMessage = null;
-          _activeBaseUrl = targetBaseUrl;
-        });
-        return;
-      }
-
-      setState(() {
-        _companies = const [];
-        _isLoadingCompanies = false;
-        _errorMessage = 'Unable to load companies';
-      });
-    }
-  }
-
-  Future<void> _handleBaseUrlChanged({bool force = false}) async {
-    final baseUrl = _normalizeBaseUrl(_baseUrlController.text);
-    if (baseUrl.isEmpty) {
-      if (!mounted) return;
-      setState(() {
-        _activeBaseUrl = '';
-        _companies = const [];
-        _selectedCompany = null;
-        _errorMessage = null;
-        _isLoadingCompanies = false;
-      });
-      return;
-    }
-
-    if (!force && baseUrl == _activeBaseUrl) {
-      return;
-    }
-
-    await ApiService().setBaseUrl(baseUrl);
-    await _saveBaseUrlHistory(baseUrl);
-
-    if (!mounted) return;
-    setState(() {
-      _errorMessage = null;
-      _selectedCompany = null;
-    });
-
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.remove(_companyIdKey);
-    await prefs.remove(_companyNameKey);
-    await prefs.remove(_companyCodeKey);
-
-    await _loadCompanies(baseUrl: baseUrl);
-  }
-
-  void _onBaseUrlInputChanged(String _) {
-    _baseUrlDebounce?.cancel();
-    _baseUrlDebounce = Timer(
-      const Duration(milliseconds: 700),
-      () => _handleBaseUrlChanged(),
+  void _scheduleOutletLookup() {
+    _usernameLookupDebounce?.cancel();
+    _usernameLookupDebounce = Timer(
+      const Duration(milliseconds: 450),
+      _loadOutletCounterMappingsForCurrentUser,
     );
   }
 
-  Future<void> _saveSelectedCompany(_CompanyOption company) async {
+  bool get _requiresOutletSelection => _outletMappings.isNotEmpty;
+  bool get _isOutletDropdownEnabled => !_isLoadingOutletMappings && outlets.isNotEmpty;
+  bool get _isCounterDropdownEnabled =>
+      !_isLoadingOutletMappings && selectedOutlet != null && counter.isNotEmpty;
+
+  Future<void> _loadOutletCounterMappingsForCurrentUser() async {
+    final username = usernameController.text.trim();
+    if (username.isEmpty) {
+      if (!mounted) return;
+      setState(() {
+        _outletMappings = [];
+        outlets = [];
+        counter = [];
+        selectedOutlet = null;
+        selectedCashier = null;
+        _isLoadingOutletMappings = false;
+        _outletMappingMessage = null;
+      });
+      return;
+    }
+
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_companyIdKey, company.id);
-    await prefs.setString(_companyNameKey, company.name);
-    await prefs.setString(_companyCodeKey, company.code);
+    final companyId = prefs.getString(_companyIdKey)?.trim() ?? '';
+    final baseUrl = _normalizeBaseUrl(await ApiService().getSavedBaseUrl());
+
+    if (companyId.isEmpty || baseUrl.isEmpty) {
+      if (!mounted) return;
+      setState(() {
+        _outletMappings = [];
+        outlets = [];
+        counter = [];
+        selectedOutlet = null;
+        selectedCashier = null;
+        _isLoadingOutletMappings = false;
+        _outletMappingMessage = null;
+      });
+      return;
+    }
+
+    if (!await _hasNetworkConnection()) {
+      if (!mounted) return;
+      setState(() {
+        _isLoadingOutletMappings = false;
+        _outletMappings = [];
+        outlets = [];
+        counter = [];
+        selectedOutlet = null;
+        selectedCashier = null;
+        _outletMappingMessage = 'Outlet and counter will load when you are back online.';
+      });
+      return;
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _isLoadingOutletMappings = true;
+      _outletMappingMessage = 'Checking outlet access...';
+      _outletMappings = [];
+      outlets = [];
+      counter = [];
+      selectedOutlet = null;
+      selectedCashier = null;
+    });
+
+    try {
+      final response = await _loginLookupDio.get(
+        '${_pillayrProductsApiRoot(baseUrl)}/alloutlets',
+        queryParameters: {
+          'compid': companyId,
+          'loginname': "'$username'",
+        },
+      );
+
+      if (username != usernameController.text.trim()) {
+        return;
+      }
+
+      final responseData = response.data;
+      final datalist = responseData is Map && responseData['datalist'] is List
+          ? (responseData['datalist'] as List)
+          : const [];
+
+      final mappings = datalist
+          .whereType<Map>()
+          .map((row) => _OutletCounterMapping.fromMap(Map<String, dynamic>.from(row)))
+          .where((mapping) => mapping.outlet.isNotEmpty && mapping.counter.isNotEmpty)
+          .toList();
+
+      final uniqueOutlets = mappings
+          .map((mapping) => mapping.outlet)
+          .toSet()
+          .toList()
+        ..sort();
+
+      if (!mounted) return;
+      setState(() {
+        _outletMappings = mappings;
+        outlets = uniqueOutlets;
+        counter = [];
+        selectedOutlet = null;
+        selectedCashier = null;
+        _isLoadingOutletMappings = false;
+        _outletMappingMessage = mappings.isEmpty
+            ? 'This username is not mapped to any outlet or counter. You can still sign in.'
+            : 'Select your outlet and counter to continue.';
+      });
+    } catch (_) {
+      if (username != usernameController.text.trim() || !mounted) {
+        return;
+      }
+
+      setState(() {
+        _outletMappings = [];
+        outlets = [];
+        counter = [];
+        selectedOutlet = null;
+        selectedCashier = null;
+        _isLoadingOutletMappings = false;
+        _outletMappingMessage =
+            'We could not load outlet access right now. You can still sign in if no mapping is required.';
+      });
+    }
+  }
+
+  String _pillayrProductsApiRoot(String baseUrl) {
+    final lower = baseUrl.toLowerCase();
+    const marker = '/focus8api';
+    final markerIndex = lower.indexOf(marker);
+    final root = markerIndex >= 0 ? baseUrl.substring(0, markerIndex) : baseUrl;
+    return '$root/pillayrpos/api/products';
+  }
+
+  void _handleOutletChanged(String? value) {
+    final nextCounters = value == null
+        ? <String>[]
+        : _outletMappings
+            .where((mapping) => mapping.outlet == value)
+            .map((mapping) => mapping.counter)
+            .toSet()
+            .toList()
+          ..sort();
+
+    setState(() {
+      selectedOutlet = value;
+      selectedCashier = null;
+      counter = nextCounters;
+    });
   }
 
   Future<void> handleLogin() async {
     final username = usernameController.text.trim();
     final password = passwordController.text;
-    final baseUrl = _normalizeBaseUrl(_baseUrlController.text);
+    final prefs = await SharedPreferences.getInstance();
+    final baseUrl = _normalizeBaseUrl(await ApiService().getSavedBaseUrl());
+    final companyId = prefs.getString(_companyIdKey)?.trim();
+    final companyName = prefs.getString(_companyNameKey)?.trim() ?? '';
 
     if (username.isEmpty) {
-      _showSnackBar('Please enter username');
+      _showSnackBar('Enter your username to continue.');
       return;
     }
     if (password.isEmpty) {
-      _showSnackBar('Please enter password');
+      _showSnackBar('Enter your password to continue.');
       return;
     }
     if (baseUrl.isEmpty) {
-      _showSnackBar('Please enter base URL');
+      _showSnackBar('Open Settings and add the API URL before signing in.');
       return;
     }
-    if (_selectedCompany == null) {
-      _showSnackBar('Please select a company');
+    if (companyId == null || companyId.isEmpty) {
+      _showSnackBar('Open Settings and choose a company before signing in.');
+      return;
+    }
+    if (_requiresOutletSelection && selectedOutlet == null) {
+      _showSnackBar('Select your outlet before signing in.');
+      return;
+    }
+    if (_requiresOutletSelection && selectedCashier == null) {
+      _showSnackBar('Select your counter before signing in.');
       return;
     }
 
@@ -311,12 +305,29 @@ class _LoginScreenState extends State<LoginScreen> {
 
     try {
       await ApiService().setBaseUrl(baseUrl);
-      await _saveBaseUrlHistory(baseUrl);
+
+      if (!await _hasNetworkConnection()) {
+        final signedInOffline = await _attemptOfflineLogin(
+          username: username,
+          password: password,
+          companyId: companyId,
+        );
+        if (signedInOffline || !mounted) {
+          return;
+        }
+
+        setState(() {
+          _errorMessage =
+              'No connection detected. Use the saved username and password for offline sign-in, or reconnect and try again.';
+        });
+        _showSnackBar(_errorMessage!);
+        return;
+      }
 
       final loginData = await ApiService().login(
         username: username,
         password: password,
-        companyId: _selectedCompany!.id,
+        companyId: companyId,
       );
 
       final loginId = loginData['iLoginId']?.toString() ?? username;
@@ -334,11 +345,22 @@ class _LoginScreenState extends State<LoginScreen> {
         displayName: displayName,
         token: sessionId,
       );
+      await AuthService().saveOfflineLoginCredentials(
+        username: username,
+        password: password,
+        companyId: companyId,
+        companyName: companyName,
+        role: AppConstants.roleCashier,
+        userId: loginId,
+        displayName: displayName,
+      );
 
       if (!mounted) return;
 
       _showSnackBar(
-        'Login successful. Welcome $displayName.',
+        companyName.isNotEmpty
+            ? 'Welcome back, $displayName. You are now signed in to $companyName.'
+            : 'Welcome back, $displayName. You are now signed in.',
         backgroundColor: Colors.green.shade600,
       );
 
@@ -346,17 +368,26 @@ class _LoginScreenState extends State<LoginScreen> {
       if (!mounted) return;
       Navigator.pushReplacementNamed(context, '/main');
     } on ApiException catch (e) {
+      if (_canUseOfflineLogin(e)) {
+        final signedInOffline = await _attemptOfflineLogin(
+          username: username,
+          password: password,
+          companyId: companyId,
+        );
+        if (signedInOffline) {
+          return;
+        }
+      }
+
       if (!mounted) return;
       setState(() {
-        _errorMessage = e.message.isNotEmpty
-            ? e.message
-            : 'Incorrect username or password';
+        _errorMessage = _friendlyLoginErrorMessage(e);
       });
       _showSnackBar(_errorMessage!);
     } catch (_) {
       if (!mounted) return;
       setState(() {
-        _errorMessage = 'Unable to login. Please try again.';
+        _errorMessage = 'We could not sign you in right now. Please try again.';
       });
       _showSnackBar(_errorMessage!);
     } finally {
@@ -378,14 +409,78 @@ class _LoginScreenState extends State<LoginScreen> {
     );
   }
 
+  Future<bool> _hasNetworkConnection() async {
+    final dynamic result = await Connectivity().checkConnectivity();
+    if (result is List<ConnectivityResult>) {
+      return result.any((item) => item != ConnectivityResult.none);
+    }
+    return result != ConnectivityResult.none;
+  }
+
+  Future<bool> _attemptOfflineLogin({
+    required String username,
+    required String password,
+    required String companyId,
+  }) async {
+    final offlineLogin = await AuthService().tryOfflineLogin(
+      username: username,
+      password: password,
+      companyId: companyId,
+    );
+
+    if (offlineLogin == null) {
+      return false;
+    }
+
+    if (!mounted) {
+      return true;
+    }
+
+    _showSnackBar(
+      offlineLogin.companyName.isNotEmpty
+          ? 'You are offline, but we signed you in with the saved ${offlineLogin.companyName} account. Welcome back, ${offlineLogin.displayName}.'
+          : 'You are offline, but we signed you in with the details saved on this device. Welcome back, ${offlineLogin.displayName}.',
+      backgroundColor: Colors.green.shade600,
+    );
+    await Future.delayed(const Duration(milliseconds: 800));
+    if (!mounted) {
+      return true;
+    }
+    Navigator.pushReplacementNamed(context, '/main');
+    return true;
+  }
+
+  bool _canUseOfflineLogin(ApiException error) {
+    if (error.code == -1) {
+      return true;
+    }
+
+    final message = error.message.toLowerCase();
+    return message.contains('internet') ||
+        message.contains('network') ||
+        message.contains('timeout') ||
+        message.contains('reach the server') ||
+        message.contains('offline');
+  }
+
+  String _friendlyLoginErrorMessage(ApiException error) {
+    if (_canUseOfflineLogin(error)) {
+      return 'You are offline right now. Use the same saved username and password to sign in, or reconnect to the internet and try again.';
+    }
+
+    final message = error.message.trim();
+    if (message.isEmpty) {
+      return 'We could not sign you in right now. Please try again.';
+    }
+
+    return message;
+  }
+
   @override
   void dispose() {
-    _baseUrlDebounce?.cancel();
+    _usernameLookupDebounce?.cancel();
     usernameController.dispose();
     passwordController.dispose();
-    _baseUrlController.dispose();
-    _adminUserController.dispose();
-    _adminPassController.dispose();
     super.dispose();
   }
 
@@ -422,188 +517,226 @@ class _LoginScreenState extends State<LoginScreen> {
           ),
         ),
         child: SafeArea(
-          child: Padding(
-            padding: EdgeInsets.symmetric(horizontal: horizontalPadding),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              mainAxisAlignment: MainAxisAlignment.center,
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                // Enhanced Logo Container with soft shadow
-                Container(
-                  height: MediaQuery.of(context).size.height * 0.12,
-                  alignment: Alignment.center,
-                  child: Hero(
-                    tag: 'app_logo',
-                    child: Container(
-                      padding: EdgeInsets.all(4 * scale),
-                      decoration: BoxDecoration(
-                        shape: BoxShape.circle,
-                        boxShadow: [
-                          BoxShadow(
-                            color: Colors.black.withOpacity(0.05),
-                            blurRadius: 12,
-                            offset: const Offset(0, 4),
-                          ),
-                        ],
-                      ),
-                      child: Image.asset(
-                        'assets/logo2-removebg-preview.png',
-                        height: 76 * scale,
-                        fit: BoxFit.contain,
-                      ),
-                    ),
-                  ),
+          child: Column(
+            children: [
+              Padding(
+                padding: EdgeInsets.fromLTRB(
+                  horizontalPadding,
+                  8 * scale,
+                  horizontalPadding,
+                  0,
                 ),
-                SizedBox(height: 6 * scale),
-
-                // Welcome Section with subtle divider and enhanced typography
-                ModernWelcomeSection(scale: scale),
-                SizedBox(height: 18 * scale),
-
-                // Form Container with subtle card effect (no scroll, just visual grouping)
-                Container(
-                  decoration: BoxDecoration(
-                    color: Colors.white.withOpacity(0.92),
-                    borderRadius: BorderRadius.circular(28 * scale),
-                    boxShadow: [
-                      BoxShadow(
-                        color: Colors.black.withOpacity(0.03),
-                        blurRadius: 20,
-                        offset: const Offset(0, 6),
+                child: Row(
+                  children: [
+                    const Spacer(),
+                    _LoginSettingsButton(
+                      scale: scale,
+                      onTap: _openSetupScreen,
+                    ),
+                  ],
+                ),
+              ),
+              Expanded(
+                child: Padding(
+                  padding: EdgeInsets.symmetric(horizontal: horizontalPadding),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Container(
+                        height: MediaQuery.of(context).size.height * 0.12,
+                        alignment: Alignment.center,
+                        child: Hero(
+                          tag: 'app_logo',
+                          child: Container(
+                            padding: EdgeInsets.all(4 * scale),
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              boxShadow: [
+                                BoxShadow(
+                                  color: Colors.black.withOpacity(0.05),
+                                  blurRadius: 12,
+                                  offset: const Offset(0, 4),
+                                ),
+                              ],
+                            ),
+                            child: Image.asset(
+                              'assets/logo2-removebg-preview.png',
+                              height: 76 * scale,
+                              fit: BoxFit.contain,
+                            ),
+                          ),
+                        ),
                       ),
+                      SizedBox(height: 6 * scale),
+                      ModernWelcomeSection(scale: scale),
+                      SizedBox(height: 18 * scale),
+                      Container(
+                        decoration: BoxDecoration(
+                          color: Colors.white.withOpacity(0.92),
+                          borderRadius: BorderRadius.circular(28 * scale),
+                          boxShadow: [
+                            BoxShadow(
+                              color: Colors.black.withOpacity(0.03),
+                              blurRadius: 20,
+                              offset: const Offset(0, 6),
+                            ),
+                          ],
+                        ),
+                        child: Padding(
+                          padding: EdgeInsets.all(12 * scale),
+                          child: Column(
+                            children: [
+                              ModernTextField(
+                                controller: usernameController,
+                                hintText: 'Username',
+                                icon: Icons.person_outline_rounded,
+                                isPassword: false,
+                                scale: scale,
+                              ),
+                              SizedBox(height: 12 * scale),
+                              ModernTextField(
+                                controller: passwordController,
+                                hintText: 'Password',
+                                icon: Icons.lock_outline_rounded,
+                                isPassword: true,
+                                scale: scale,
+                              ),
+                              SizedBox(height: 12 * scale),
+                              ModernOptionalDropdown(
+                                hint: 'Outlet',
+                                value: selectedOutlet,
+                                items: outlets,
+                                onChanged: _handleOutletChanged,
+                                icon: Icons.store_outlined,
+                                scale: scale,
+                                enabled: _isOutletDropdownEnabled,
+                              ),
+                              SizedBox(height: 12 * scale),
+                              ModernOptionalDropdown(
+                                hint: 'Counter',
+                                value: selectedCashier,
+                                items: counter,
+                                onChanged: (value) => setState(() => selectedCashier = value),
+                                icon: Icons.point_of_sale_outlined,
+                                scale: scale,
+                                enabled: _isCounterDropdownEnabled,
+                              ),
+                              if (_outletMappingMessage != null) ...[
+                                SizedBox(height: 8 * scale),
+                                Row(
+                                  children: [
+                                    if (_isLoadingOutletMappings)
+                                      SizedBox(
+                                        height: 14 * scale,
+                                        width: 14 * scale,
+                                        child: CircularProgressIndicator(
+                                          strokeWidth: 2,
+                                          valueColor: AlwaysStoppedAnimation<Color>(
+                                            Colors.orange.shade600,
+                                          ),
+                                        ),
+                                      )
+                                    else
+                                      Icon(
+                                        _requiresOutletSelection
+                                            ? Icons.info_outline
+                                            : Icons.check_circle_outline,
+                                        color: Colors.grey.shade600,
+                                        size: 14 * scale,
+                                      ),
+                                    SizedBox(width: 8 * scale),
+                                    Expanded(
+                                      child: Text(
+                                        _outletMappingMessage!,
+                                        style: TextStyle(
+                                          color: Colors.grey.shade700,
+                                          fontSize: 12.5 * scale,
+                                          fontWeight: FontWeight.w500,
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ],
+                              SizedBox(height: 12 * scale),
+                              _LoginSetupSummary(
+                                scale: scale,
+                                isLoading: _isLoadingSetup,
+                                baseUrl: _configuredBaseUrl,
+                                companyName: _configuredCompanyName,
+                                companyCode: _configuredCompanyCode,
+                                onTap: _openSetupScreen,
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                      SizedBox(height: 18 * scale),
+                      ModernLoginButton(
+                        onPressed: _isLoading ? () {} : handleLogin,
+                        scale: scale,
+                      ),
+                      SizedBox(height: 10 * scale),
+                      if (_isLoading)
+                        Center(
+                          child: TweenAnimationBuilder(
+                            tween: Tween<double>(begin: 0, end: 1),
+                            duration: const Duration(milliseconds: 400),
+                            builder: (context, value, child) {
+                              return Opacity(
+                                opacity: value,
+                                child: SizedBox(
+                                  height: 24 * scale,
+                                  width: 24 * scale,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2.5,
+                                    valueColor: AlwaysStoppedAnimation<Color>(
+                                      Colors.orange.shade600,
+                                    ),
+                                  ),
+                                ),
+                              );
+                            },
+                          ),
+                        )
+                      else if (_errorMessage != null)
+                        Container(
+                          padding: EdgeInsets.symmetric(vertical: 6 * scale),
+                          child: Row(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              Icon(
+                                Icons.error_outline,
+                                color: Colors.redAccent,
+                                size: 14 * scale,
+                              ),
+                              SizedBox(width: 8 * scale),
+                              Flexible(
+                                child: Text(
+                                  _errorMessage!,
+                                  maxLines: 2,
+                                  overflow: TextOverflow.ellipsis,
+                                  textAlign: TextAlign.center,
+                                  style: TextStyle(
+                                    color: Colors.redAccent.shade700,
+                                    fontSize: 13 * scale,
+                                    fontWeight: FontWeight.w500,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        )
+                      else
+                        SizedBox(height: 24 * scale),
+                      ModernFooter(scale: scale),
+                      SizedBox(height: 12 * scale),
                     ],
                   ),
-                  child: Padding(
-                    padding: EdgeInsets.all(12 * scale),
-                    child: Column(
-                      children: [
-                        ModernTextField(
-                          controller: usernameController,
-                          hintText: 'Username',
-                          icon: Icons.person_outline_rounded,
-                          isPassword: false,
-                          scale: scale,
-                        ),
-                        SizedBox(height: 12 * scale),
-
-                        ModernTextField(
-                          controller: passwordController,
-                          hintText: 'Password',
-                          icon: Icons.lock_outline_rounded,
-                          isPassword: true,
-                          scale: scale,
-                        ),
-                        SizedBox(height: 12 * scale),
-
-                        ModernOptionalDropdown(
-                          hint: 'Outlet',
-                          value: selectedOutlet,
-                          items: outlets,
-                          onChanged: (value) => setState(() => selectedOutlet = value),
-                          icon: Icons.store_outlined,
-                          scale: scale,
-                        ),
-                        SizedBox(height: 12 * scale),
-
-                        ModernOptionalDropdown(
-                          hint: 'Counter',
-                          value: selectedCashier,
-                          items: counter,
-                          onChanged: (value) => setState(() => selectedCashier = value),
-                          icon: Icons.point_of_sale_outlined,
-                          scale: scale,
-                        ),
-                        SizedBox(height: 12 * scale),
-
-                        _CompactBaseUrlField(
-                          controller: _baseUrlController,
-                          scale: scale,
-                          isLoading: _isLoadingCompanies,
-                          onChanged: _onBaseUrlInputChanged,
-                          onSubmitted: (_) => _handleBaseUrlChanged(force: true),
-                        ),
-                        SizedBox(height: 12 * scale),
-
-                        _ModernCompanyDropdown(
-                          companies: _companies,
-                          selectedCompany: _selectedCompany,
-                          isLoading: _isLoadingCompanies,
-                          scale: scale,
-                          onChanged: (company) async {
-                            if (company == null) return;
-                            await _saveSelectedCompany(company);
-                            if (!mounted) return;
-                            setState(() => _selectedCompany = company);
-                          },
-                        ),
-                      ],
-                    ),
-                  ),
                 ),
-                SizedBox(height: 18 * scale),
-
-                // Login button & loading / error area
-                ModernLoginButton(
-                  onPressed: _isLoading ? () {} : handleLogin,
-                  scale: scale,
-                ),
-                SizedBox(height: 10 * scale),
-
-                if (_isLoading)
-                  Center(
-                    child: TweenAnimationBuilder(
-                      tween: Tween<double>(begin: 0, end: 1),
-                      duration: const Duration(milliseconds: 400),
-                      builder: (context, value, child) {
-                        return Opacity(
-                          opacity: value,
-                          child: SizedBox(
-                            height: 24 * scale,
-                            width: 24 * scale,
-                            child: CircularProgressIndicator(
-                              strokeWidth: 2.5,
-                              valueColor: AlwaysStoppedAnimation<Color>(
-                                Colors.orange.shade600,
-                              ),
-                            ),
-                          ),
-                        );
-                      },
-                    ),
-                  )
-                else if (_errorMessage != null)
-                  Container(
-                    padding: EdgeInsets.symmetric(vertical: 6 * scale),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        Icon(Icons.error_outline, color: Colors.redAccent, size: 14 * scale),
-                        SizedBox(width: 8 * scale),
-                        Flexible(
-                          child: Text(
-                            _errorMessage!,
-                            maxLines: 2,
-                            overflow: TextOverflow.ellipsis,
-                            textAlign: TextAlign.center,
-                            style: TextStyle(
-                              color: Colors.redAccent.shade700,
-                              fontSize: 13 * scale,
-                              fontWeight: FontWeight.w500,
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  )
-                else
-                  SizedBox(height: 24 * scale),
-
-                // Footer version
-                ModernFooter(scale: scale),
-                SizedBox(height: 12 * scale),
-              ],
-            ),
+              ),
+            ],
           ),
         ),
       ),
@@ -740,6 +873,7 @@ class ModernOptionalDropdown extends StatelessWidget {
   final Function(String?) onChanged;
   final IconData icon;
   final double scale;
+  final bool enabled;
 
   const ModernOptionalDropdown({
     super.key,
@@ -749,6 +883,7 @@ class ModernOptionalDropdown extends StatelessWidget {
     required this.onChanged,
     required this.icon,
     required this.scale,
+    this.enabled = true,
   });
 
   @override
@@ -756,9 +891,12 @@ class ModernOptionalDropdown extends StatelessWidget {
     return Container(
       padding: EdgeInsets.symmetric(horizontal: 16 * scale, vertical: 2 * scale),
       decoration: BoxDecoration(
-        color: Colors.white,
+        color: enabled ? Colors.white : Colors.grey.shade100,
         borderRadius: BorderRadius.circular(18 * scale),
-        border: Border.all(color: Colors.grey.shade200, width: 1.2),
+        border: Border.all(
+          color: enabled ? Colors.grey.shade200 : Colors.grey.shade300,
+          width: 1.2,
+        ),
         boxShadow: [
           BoxShadow(
             color: Colors.black.withOpacity(0.01),
@@ -771,11 +909,15 @@ class ModernOptionalDropdown extends StatelessWidget {
         child: DropdownButton<String?>(
           value: value,
           isExpanded: true,
-          icon: Icon(icon, color: Colors.grey.shade500, size: 22 * scale),
+          icon: Icon(
+            icon,
+            color: enabled ? Colors.grey.shade500 : Colors.grey.shade400,
+            size: 22 * scale,
+          ),
           hint: Text(
             hint,
             style: TextStyle(
-              color: Colors.grey.shade600,
+              color: enabled ? Colors.grey.shade600 : Colors.grey.shade400,
               fontSize: 16.5 * scale,
               fontWeight: FontWeight.w500,
             ),
@@ -786,14 +928,14 @@ class ModernOptionalDropdown extends StatelessWidget {
               child: Text(
                 item ?? hint,
                 style: TextStyle(
-                  color: Colors.black87,
+                  color: enabled ? Colors.black87 : Colors.grey.shade500,
                   fontSize: 16 * scale,
                   fontWeight: FontWeight.w500,
                 ),
               ),
             );
           }).toList(),
-          onChanged: onChanged,
+          onChanged: enabled ? onChanged : null,
         ),
       ),
     );
@@ -881,167 +1023,75 @@ class ModernFooter extends StatelessWidget {
   }
 }
 
-class _CompactBaseUrlField extends StatelessWidget {
-  const _CompactBaseUrlField({
-    required this.controller,
+class _LoginSettingsButton extends StatelessWidget {
+  const _LoginSettingsButton({
     required this.scale,
-    required this.isLoading,
-    required this.onChanged,
-    required this.onSubmitted,
+    required this.onTap,
   });
 
-  final TextEditingController controller;
   final double scale;
-  final bool isLoading;
-  final ValueChanged<String> onChanged;
-  final ValueChanged<String> onSubmitted;
+  final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      padding: EdgeInsets.symmetric(horizontal: 16 * scale, vertical: 2 * scale),
-      decoration: BoxDecoration(
-        color: Colors.white,
+    return Material(
+      color: Colors.white.withOpacity(0.92),
+      borderRadius: BorderRadius.circular(18 * scale),
+      child: InkWell(
         borderRadius: BorderRadius.circular(18 * scale),
-        border: Border.all(color: Colors.grey.shade200, width: 1.2),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withOpacity(0.01),
-            blurRadius: 4,
-            offset: const Offset(0, 1),
+        onTap: onTap,
+        child: Padding(
+          padding: EdgeInsets.all(12 * scale),
+          child: Icon(
+            Icons.settings_rounded,
+            size: 22 * scale,
+            color: const Color(0xFF0D3B66),
           ),
-        ],
-      ),
-      child: Row(
-        children: [
-          Icon(Icons.link_rounded, color: Colors.grey.shade500, size: 22 * scale),
-          SizedBox(width: 12 * scale),
-          Expanded(
-            child: TextField(
-              controller: controller,
-              keyboardType: TextInputType.url,
-              textInputAction: TextInputAction.done,
-              onChanged: onChanged,
-              onSubmitted: onSubmitted,
-              style: TextStyle(
-                fontSize: 16.5 * scale,
-                fontWeight: FontWeight.w500,
-                color: Colors.black87,
-              ),
-              decoration: InputDecoration(
-                hintText: 'Base URL',
-                hintStyle: TextStyle(
-                  fontSize: 16.5 * scale,
-                  fontWeight: FontWeight.w500,
-                  color: Colors.grey.shade500,
-                ),
-                border: InputBorder.none,
-                isDense: true,
-              ),
-            ),
-          ),
-          if (isLoading)
-            SizedBox(
-              height: 20 * scale,
-              width: 20 * scale,
-              child: CircularProgressIndicator(
-                strokeWidth: 2,
-                valueColor: AlwaysStoppedAnimation<Color>(Colors.orange.shade400),
-              ),
-            )
-          else
-            Icon(
-              Icons.cloud_done_outlined,
-              color: Colors.grey.shade400,
-              size: 20 * scale,
-            ),
-          SizedBox(width: 6 * scale),
-        ],
+        ),
       ),
     );
   }
 }
 
-class _ModernCompanyDropdown extends StatelessWidget {
-  const _ModernCompanyDropdown({
-    required this.companies,
-    required this.selectedCompany,
-    required this.isLoading,
+class _LoginSetupSummary extends StatelessWidget {
+  const _LoginSetupSummary({
     required this.scale,
-    required this.onChanged,
+    required this.isLoading,
+    required this.baseUrl,
+    required this.companyName,
+    required this.companyCode,
+    required this.onTap,
   });
 
-  final List<_CompanyOption> companies;
-  final _CompanyOption? selectedCompany;
-  final bool isLoading;
   final double scale;
-  final ValueChanged<_CompanyOption?> onChanged;
+  final bool isLoading;
+  final String baseUrl;
+  final String companyName;
+  final String companyCode;
+  final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      padding: EdgeInsets.symmetric(horizontal: 16 * scale, vertical: 2 * scale),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(18 * scale),
-        border: Border.all(color: Colors.grey.shade200, width: 1.2),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withOpacity(0.01),
-            blurRadius: 4,
-            offset: const Offset(0, 1),
-          ),
-        ],
-      ),
-      child: Row(
-        children: [
-          Icon(Icons.apartment_rounded, color: Colors.grey.shade500, size: 22 * scale),
-          SizedBox(width: 12 * scale),
-          Expanded(
-            child: DropdownButtonHideUnderline(
-              child: DropdownButton<_CompanyOption>(
-                value: companies.any((company) => company.id == selectedCompany?.id)
-                    ? selectedCompany
-                    : null,
-                isExpanded: true,
-                icon: isLoading
-                    ? SizedBox(
-                        height: 20 * scale,
-                        width: 20 * scale,
-                        child: CircularProgressIndicator(
-                          strokeWidth: 2,
-                          valueColor: AlwaysStoppedAnimation<Color>(Colors.orange.shade400),
-                        ),
-                      )
-                    : Icon(Icons.keyboard_arrow_down_rounded, size: 24 * scale),
-                hint: Text(
-                  isLoading ? 'Loading companies...' : 'Select company',
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    color: Colors.grey.shade600,
-                    fontSize: 16.5 * scale,
-                    fontWeight: FontWeight.w500,
-                  ),
-                ),
-                items: companies.map((company) {
-                  return DropdownMenuItem<_CompanyOption>(
-                    value: company,
-                    child: Text(
-                      '${company.code} - ${company.name}',
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        fontSize: 16 * scale,
-                        fontWeight: FontWeight.w500,
-                        color: Colors.black87,
-                      ),
-                    ),
-                  );
-                }).toList(),
-                onChanged: isLoading ? null : onChanged,
+    final hasBaseUrl = baseUrl.isNotEmpty;
+    final hasCompany = companyName.isNotEmpty;
+
+    return InkWell(
+      borderRadius: BorderRadius.circular(18 * scale),
+      onTap: onTap,
+      child: Container(
+        width: double.infinity,
+        padding: EdgeInsets.all(14 * scale),
+        child: isLoading
+            ? Row(
+                children: [
+                  
+                ],
+              )
+            : Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                ],
               ),
-            ),
-          ),
-        ],
       ),
     );
   }
@@ -1072,5 +1122,22 @@ class _CompanyOption {
       'CompanyName': name,
       'CompanyCode': code,
     };
+  }
+}
+
+class _OutletCounterMapping {
+  const _OutletCounterMapping({
+    required this.outlet,
+    required this.counter,
+  });
+
+  final String outlet;
+  final String counter;
+
+  factory _OutletCounterMapping.fromMap(Map<String, dynamic> map) {
+    return _OutletCounterMapping(
+      outlet: map['outlet']?.toString().trim() ?? '',
+      counter: map['countername']?.toString().trim() ?? '',
+    );
   }
 }

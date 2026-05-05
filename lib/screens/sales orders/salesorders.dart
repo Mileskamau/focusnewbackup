@@ -49,7 +49,9 @@ class _BillingScreenState extends State<BillingScreen> {
   String _selectedCategory = 'All';
   List<String> _categories = ['All'];
   int _cartItemCount = 0;
-  double _cartTotal = 0;
+  double _cartSubtotal = 0;
+  double _cartTaxTotal = 0;
+  double _cartGrandTotal = 0;
   final ValueNotifier<int> _cartVersion = ValueNotifier<int>(0);
 
   // Scanner service – use local instance (no Provider needed)
@@ -67,6 +69,7 @@ class _BillingScreenState extends State<BillingScreen> {
   bool _isLoadingProducts = true;
   bool _isRefreshingProducts = false;
   int _visibleProductCount = ProductSyncService.pageSize;
+  static const int _stockInfoBatchSize = 100;
   Timer? _productSyncTimer;
   final Map<String, ProductStockInfo> _productStockInfoById = {};
   final Set<String> _loadingProductStockIds = <String>{};
@@ -149,7 +152,9 @@ class _BillingScreenState extends State<BillingScreen> {
 
   Future<void> _syncProductsIfDue() async {
     try {
-      final result = await ProductSyncService().ensureProductsLoaded();
+      final result = await ProductSyncService().ensureProductsLoaded(
+        source: ProductCatalogSource.sellerPriceBook,
+      );
       if (result.usedRemoteData && mounted) {
         await _loadProducts();
       }
@@ -175,7 +180,7 @@ class _BillingScreenState extends State<BillingScreen> {
       _visibleProductCount = (_visibleProductCount + ProductSyncService.pageSize)
           .clamp(0, _filteredProducts.length);
     });
-    _fetchVisibleProductStockInfo();
+    _fetchProductStockInfo(_filteredProducts);
   }
 
   void _filterProducts() {
@@ -197,12 +202,15 @@ class _BillingScreenState extends State<BillingScreen> {
               ? filteredProducts.length
               : ProductSyncService.pageSize;
     });
-    _fetchVisibleProductStockInfo();
+    _fetchProductStockInfo(filteredProducts);
   }
 
-  Future<void> _fetchVisibleProductStockInfo({bool forceRefresh = false}) async {
+  Future<void> _fetchProductStockInfo(
+    List<Product> products, {
+    bool forceRefresh = false,
+  }) async {
     final idsToLoad = <String>[];
-    for (final product in _visibleProducts) {
+    for (final product in products) {
       final productId = product.id.trim();
       if (productId.isEmpty || _loadingProductStockIds.contains(productId)) {
         continue;
@@ -225,9 +233,17 @@ class _BillingScreenState extends State<BillingScreen> {
 
     _loadingProductStockIds.addAll(idsToLoad);
     try {
-      final stockInfo = await ApiService().getStockInformationByProductIds(
-        idsToLoad,
-      );
+      final stockInfo = <String, ProductStockInfo>{};
+      for (var index = 0; index < idsToLoad.length; index += _stockInfoBatchSize) {
+        final batch = idsToLoad
+            .skip(index)
+            .take(_stockInfoBatchSize)
+            .toList();
+        final batchStockInfo = await ApiService().getStockInformationByProductIds(
+          batch,
+        );
+        stockInfo.addAll(batchStockInfo);
+      }
       if (!mounted) return;
       setState(() {
         _productStockInfoById.addAll(stockInfo);
@@ -235,17 +251,11 @@ class _BillingScreenState extends State<BillingScreen> {
           final liveInfo = stockInfo[product.id];
           if (liveInfo == null) continue;
           product.stockQty = liveInfo.availableStockQty;
-          if (liveInfo.avgRate > 0) {
-            product.price = liveInfo.avgRate;
-          }
         }
         for (final item in _cart) {
           final liveInfo = stockInfo[item.product.id];
           if (liveInfo == null) continue;
           item.product.stockQty = liveInfo.availableStockQty;
-          if (liveInfo.avgRate > 0) {
-            item.product.price = liveInfo.avgRate;
-          }
         }
         _sortProductsByAvailability();
         _updateTotals();
@@ -277,6 +287,7 @@ class _BillingScreenState extends State<BillingScreen> {
       try {
         final result = await ProductSyncService().ensureProductsLoaded(
           forceRefresh: forceRefresh,
+          source: ProductCatalogSource.sellerPriceBook,
         );
         if (forceRefresh && mounted) {
           final message = result.usedRemoteData
@@ -366,7 +377,9 @@ class _BillingScreenState extends State<BillingScreen> {
 
   void _updateTotals() {
     _cartItemCount = _cart.fold(0, (sum, item) => sum + item.quantity);
-    _cartTotal = _cart.fold(0, (sum, item) => sum + item.total);
+    _cartSubtotal = _cart.fold(0, (sum, item) => sum + item.total);
+    _cartTaxTotal = _cart.fold(0, (sum, item) => sum + _itemTaxAmount(item));
+    _cartGrandTotal = _cartSubtotal + _cartTaxTotal;
     _cartVersion.value++;
   }
 
@@ -376,8 +389,19 @@ class _BillingScreenState extends State<BillingScreen> {
   }
 
   double _effectiveUnitPrice(Product product) {
-    final livePrice = _productStockInfoById[product.id]?.avgRate ?? 0;
-    return livePrice > 0 ? livePrice : product.price;
+    return product.price;
+  }
+
+  double _productTaxRate(Product product) {
+    return product.taxRate < 0 ? 0 : product.taxRate;
+  }
+
+  double _itemTaxAmount(CartItem item) {
+    return item.total * (_productTaxRate(item.product) / 100);
+  }
+
+  String _formatPercentage(double value) {
+    return value % 1 == 0 ? value.toStringAsFixed(0) : value.toStringAsFixed(2);
   }
 
   int _compareProductsByAvailability(Product a, Product b) {
@@ -396,6 +420,22 @@ class _BillingScreenState extends State<BillingScreen> {
 
   String _formatProductMetric(num value) {
     return value % 1 == 0 ? value.toStringAsFixed(0) : value.toStringAsFixed(2);
+  }
+
+  String get _currencyLabel {
+    for (final item in _cart) {
+      final code = item.product.currencyCode.trim();
+      if (code.isNotEmpty) {
+        return code;
+      }
+    }
+    for (final product in _products) {
+      final code = product.currencyCode.trim();
+      if (code.isNotEmpty) {
+        return code;
+      }
+    }
+    return AppConstants.currencySymbol;
   }
 
   Future<void> _addToCart(Product product) async {
@@ -925,9 +965,9 @@ Future<void> _createOrder() async {
     final userRole = _auth.getUserRole();
     final customerName = _selectedMember!['name']!;
 
-    final subtotal = _cartTotal;
-    final tax = subtotal * AppConstants.taxRate;
-    final total = subtotal + tax;
+    final subtotal = _cartSubtotal;
+    final tax = _cartTaxTotal;
+    final total = _cartGrandTotal;
 
     final order = Order(
       id: _uuid.v4(),
@@ -962,7 +1002,7 @@ Future<void> _createOrder() async {
     await _salesCartBox.clear();
     _cart.clear();
     _cartMap.clear();
-    _updateTotals();   // updates _cartVersion, _cartItemCount, _cartTotal
+    _updateTotals();   // updates _cartVersion, _cartItemCount, and totals
     if (mounted) setState(() {});   // refresh UI
 
     if (mounted) {
@@ -1012,7 +1052,7 @@ Future<void> _createOrder() async {
     final inStock = availableStock > 0;
     final cartQty = getCartQuantity(product);
     final canAdd = inStock && cartQty < availableStock;
-    final lineTotal = unitPrice * cartQty;
+    final taxLabel = _formatPercentage(_productTaxRate(product));
 
     return GestureDetector(
       onTap: () {
@@ -1094,18 +1134,12 @@ Future<void> _createOrder() async {
                     ),
                     const SizedBox(height: 2),
                     Text(
-                      '${AppConstants.currencySymbol}${unitPrice.toStringAsFixed(2)}',
+                      '$_currencyLabel${unitPrice.toStringAsFixed(2)}',
                       style: const TextStyle(color: AppTheme.primaryOrange, fontWeight: FontWeight.w700, fontSize: 12),
                     ),
                     const SizedBox(height: 2),
-                    Text(
-                      'Qty: ${stockInfo != null ? _formatProductMetric(stockInfo.quantity) : '$availableStock'}',
-                      style: TextStyle(
-                        fontSize: 9.5,
-                        fontWeight: FontWeight.w600,
-                        color: inStock ? Colors.grey.shade700 : Colors.red.shade300,
-                      ),
-                    ),
+                    
+                  
                     
                     const Spacer(),
                     Row(
@@ -1157,17 +1191,7 @@ Future<void> _createOrder() async {
                           const SizedBox(width: 20, height: 20),
                       ],
                     ),
-                    if (cartQty > 0) ...[
-                      const SizedBox(height: 2),
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          const Text('Total', style: TextStyle(fontSize: 9, color: Colors.grey)),
-                          Text('${AppConstants.currencySymbol}${lineTotal.toStringAsFixed(2)}',
-                              style: const TextStyle(fontSize: 10, fontWeight: FontWeight.w700, color: Colors.green)),
-                        ],
-                      ),
-                    ],
+                    
                   ],
                 ),
               ),
@@ -1196,8 +1220,6 @@ Future<void> _createOrder() async {
   }
 
   Widget _buildCartSheetBody(ScrollController scrollController) {
-  final taxRate = AppConstants.taxRate;
-  final taxPercent = (taxRate * 100).toInt();
   return Container(
     decoration: const BoxDecoration(
       color: Colors.white,
@@ -1276,7 +1298,7 @@ Future<void> _createOrder() async {
                           overflow: TextOverflow.ellipsis,
                         ),
                         subtitle: Text(
-                          '${AppConstants.currencySymbol}${item.product.price.toStringAsFixed(2)}',
+                          '$_currencyLabel${item.product.price.toStringAsFixed(2)} • Tax ${_formatPercentage(_productTaxRate(item.product))}%',
                           style: const TextStyle(fontSize: 11),
                         ),
                         trailing: Row(
@@ -1326,7 +1348,7 @@ Future<void> _createOrder() async {
                   children: [
                     const Text('Subtotal', style: TextStyle(fontSize: 13)),
                     Text(
-                      '${AppConstants.currencySymbol}${_cartTotal.toStringAsFixed(2)}',
+                      '$_currencyLabel${_cartSubtotal.toStringAsFixed(2)}',
                       style: const TextStyle(
                           fontSize: 13, fontWeight: FontWeight.w600),
                     ),
@@ -1336,10 +1358,10 @@ Future<void> _createOrder() async {
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    Text('Tax ($taxPercent%)',
-                        style: const TextStyle(fontSize: 12, color: Colors.grey)),
+                    const Text('Tax',
+                        style: TextStyle(fontSize: 12, color: Colors.grey)),
                     Text(
-                      '${AppConstants.currencySymbol}${(_cartTotal * taxRate).toStringAsFixed(2)}',
+                      '$_currencyLabel${_cartTaxTotal.toStringAsFixed(2)}',
                       style: const TextStyle(fontSize: 12),
                     ),
                   ],
@@ -1351,7 +1373,7 @@ Future<void> _createOrder() async {
                     const Text('Total',
                         style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
                     Text(
-                      '${AppConstants.currencySymbol}${(_cartTotal * (1 + taxRate)).toStringAsFixed(2)}',
+                      '$_currencyLabel${_cartGrandTotal.toStringAsFixed(2)}',
                       style: const TextStyle(
                           fontSize: 16,
                           fontWeight: FontWeight.w700,

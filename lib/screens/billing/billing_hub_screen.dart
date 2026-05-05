@@ -17,7 +17,7 @@ class _BillingHubScreenState extends State<BillingHubScreen> {
       appBar: AppBar(
         title: const Text('Billing'),
       ),
-      body: const BillingScreen(),
+      body: BillingScreen(),
     );
   }
 }

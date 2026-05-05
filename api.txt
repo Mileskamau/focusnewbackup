@@ -1,0 +1,191 @@
+Focus SwiftBill API Inventory
+Generated from the current code in lib/services/api_service.dart
+
+Base URL
+- Configurable at runtime from app settings / shared preferences key: api_base_url
+- Environment fallback: API_BASE_URL from .env
+- Hardcoded fallback if neither is set: http://192.168.100.15/focus8API
+
+Common Headers Sent On Requests
+- Content-Type: application/json
+- Accept: application/json
+- fSessionId: <stored session id>
+  This header is added automatically after a successful login if a session id exists in secure storage.
+
+Notes
+- All URLs below are relative to the active base URL.
+- GET requests usually send no JSON body.
+- Some endpoints accept optional query parameters. Those are listed under URL or Body/Query.
+- /Transactions/Sales Orders accepts a dynamic body passed in from the caller; the exact payload shape is not defined inside ApiService.
+
+1. Login
+Method: POST
+URL: {baseUrl}/login
+Headers:
+  Content-Type: application/json
+  Accept: application/json
+Body:
+{
+  "data": [
+    {
+      "Username": "<trimmed username>",
+      "password": "<password>",
+      "CompanyId": "<companyId>"
+    }
+  ],
+  "result": 1,
+  "message": ""
+}
+
+2. List Companies
+Method: GET
+URL: {baseUrl}/List/Company
+Headers:
+  Content-Type: application/json
+  Accept: application/json
+  fSessionId: <stored session id if available>
+Body:
+  None
+
+3. Get Products
+Method: GET
+URL: {baseUrl}/Screen/CoreMasters/Products
+Headers:
+  Content-Type: application/json
+  Accept: application/json
+  fSessionId: <stored session id if available>
+Body / Query:
+  Optional query parameters:
+  - search=<search text>
+  - category=<category>
+  - barcode=<barcode>
+
+4. Get Product Details
+Method: GET
+URL: {baseUrl}/Screen/Masters/Core_Product/{code}
+Headers:
+  Content-Type: application/json
+  Accept: application/json
+  fSessionId: <stored session id if available>
+Body:
+  None
+
+5. Get Accounts
+Method: GET
+URL: {baseUrl}/List/Masters/Core_Account
+Headers:
+  Content-Type: application/json
+  Accept: application/json
+  fSessionId: <stored session id if available>
+Body / Query:
+  Optional query parameter:
+  - accountType=<account type>
+
+6. Get Sales Orders
+Method: GET
+URL: {baseUrl}/List/Transactions/Sales Orders?page=<page>&period=<period>&status=<status>
+Headers:
+  Content-Type: application/json
+  Accept: application/json
+  fSessionId: <stored session id if available>
+Body / Query:
+  Query parameters:
+  - page=<int> (default 1)
+  - period=<today|week|month or other server-supported value> (optional)
+  - status=<status> (optional)
+
+7. Get Single Sales Order Details
+Method: GET
+URL: {baseUrl}/Screen/Transactions/Sales Orders/{voucherNo}
+Headers:
+  Content-Type: application/json
+  Accept: application/json
+  fSessionId: <stored session id if available>
+Body:
+  None
+
+8. Create Sales Order
+Method: POST
+URL: {baseUrl}/Transactions/Sales Orders
+Headers:
+  Content-Type: application/json
+  Accept: application/json
+  fSessionId: <stored session id if available>
+Body:
+  Dynamic JSON payload passed as orderData from the caller.
+  ApiService forwards the object exactly as received:
+{
+  "...": "whatever fields the caller provides"
+}
+
+9. Delete / Cancel Sales Order
+Method: DELETE
+URL: {baseUrl}/Transactions/Sales Orders/{voucherNo}
+Headers:
+  Content-Type: application/json
+  Accept: application/json
+  fSessionId: <stored session id if available>
+Body:
+  None
+
+10. Get Stock Information
+Method: POST
+URL: {baseUrl}/Transactions/Stock
+Headers:
+  Content-Type: application/json
+  Accept: application/json
+  fSessionId: <stored session id if available>
+Body:
+{
+  "data": [
+    {
+      "product__id": "<product id>",
+      "Date__Id": <calculated int date id>
+    }
+  ]
+}
+Date__Id format:
+  (year * 65536) + (month * 256) + day
+
+11. Get Dashboard Alerts
+Method: GET
+URL: {baseUrl}/Screen/Transactions/AlertApprovalCount
+Headers:
+  Content-Type: application/json
+  Accept: application/json
+  fSessionId: <stored session id if available>
+Body:
+  None
+
+12. Get Approvals
+Method: GET
+URL: {baseUrl}/Screen/Transactions/Approvals
+Headers:
+  Content-Type: application/json
+  Accept: application/json
+  fSessionId: <stored session id if available>
+Body:
+  None
+
+13. Get Preferences
+Method: GET
+URL: {baseUrl}/utility/preferences
+Headers:
+  Content-Type: application/json
+  Accept: application/json
+  fSessionId: <stored session id if available>
+Body:
+  None
+
+14. Get Report Data
+Method: GET
+URL: {baseUrl}/Reports/pagedata?id=<reportId>&filters=<filters>
+Headers:
+  Content-Type: application/json
+  Accept: application/json
+  fSessionId: <stored session id if available>
+Body / Query:
+  Required query parameter:
+  - id=<reportId>
+  Optional query parameter:
+  - filters=<filters>

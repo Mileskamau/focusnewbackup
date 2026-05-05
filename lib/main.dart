@@ -5,6 +5,7 @@ import 'package:hive_flutter/hive_flutter.dart';
 import 'package:focus_swiftbill/services/database_service.dart';
 import 'package:focus_swiftbill/services/auth_service.dart';
 import 'package:focus_swiftbill/services/api_service.dart';
+import 'package:focus_swiftbill/services/scanner_service.dart';
 import 'package:focus_swiftbill/services/session_service.dart';
 import 'package:focus_swiftbill/utils/constants.dart';
 import 'package:focus_swiftbill/theme/app_theme.dart';
@@ -103,6 +104,7 @@ class _FocusSupermarketAppState extends State<FocusSupermarketApp> with WidgetsB
         ChangeNotifierProvider(create: (_) => NavigationProvider()),
         ChangeNotifierProvider(create: (_) => OrdersProvider()), 
         ChangeNotifierProvider(create: (_) => DataRefreshProvider()),
+        ChangeNotifierProvider(create: (_) => ScannerService()),
       ],
       child: MaterialApp(
         title: AppConstants.appName,

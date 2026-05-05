@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:focus_swiftbill/theme/app_theme.dart';
-import 'package:focus_swiftbill/utils/constants.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 
 class CameraScannerScreen extends StatefulWidget {
@@ -15,13 +15,45 @@ class CameraScannerScreen extends StatefulWidget {
 
 class _CameraScannerScreenState extends State<CameraScannerScreen> {
   final MobileScannerController _controller = MobileScannerController(
-    torchEnabled: true,
+    torchEnabled: false,
     detectionSpeed: DetectionSpeed.noDuplicates,
     detectionTimeoutMs: 500,
   );
   bool _isTorchOn = false;
   String? _lastScannedBarcode;
   bool _hasDetectedBarcode = false;
+  bool _isPreparingCamera = true;
+  String? _cameraErrorMessage;
+
+  @override
+  void initState() {
+    super.initState();
+    _prepareCamera();
+  }
+
+  Future<void> _prepareCamera() async {
+    setState(() {
+      _isPreparingCamera = true;
+      _cameraErrorMessage = null;
+    });
+
+    final status = await Permission.camera.request();
+    if (!mounted) return;
+
+    if (!status.isGranted) {
+      setState(() {
+        _isPreparingCamera = false;
+        _cameraErrorMessage = status.isPermanentlyDenied
+            ? 'Camera permission is blocked. Please enable it in Settings to scan barcodes.'
+            : 'Camera permission is required to scan barcodes.';
+      });
+      return;
+    }
+
+    setState(() {
+      _isPreparingCamera = false;
+    });
+  }
 
   @override
   void dispose() {
@@ -51,36 +83,8 @@ class _CameraScannerScreenState extends State<CameraScannerScreen> {
       ),
       body: Stack(
         children: [
-          MobileScanner(
-            controller: _controller,
-            onDetect: (BarcodeCapture capture) {
-              if (_hasDetectedBarcode) return;
-              
-              final List<Barcode> barcodes = capture.barcodes;
-              for (final barcode in barcodes) {
-                final String? code = barcode.rawValue;
-                if (code != null && code.isNotEmpty) {
-                  if (_lastScannedBarcode == code) {
-                    return;
-                  }
-                  
-                  setState(() {
-                    _lastScannedBarcode = code;
-                    _hasDetectedBarcode = true;
-                  });
-
-                  HapticFeedback.lightImpact();
-
-                  Future.delayed(const Duration(milliseconds: 300), () {
-                    if (mounted) {
-                      Navigator.of(context).pop(code);
-                    }
-                  });
-                  break;
-                }
-              }
-            },
-            fit: BoxFit.cover,
+          Positioned.fill(
+            child: _buildScannerBody(),
           ),
           Align(
             alignment: Alignment.center,
@@ -99,12 +103,12 @@ class _CameraScannerScreenState extends State<CameraScannerScreen> {
                     child: Container(
                       width: 30,
                       height: 30,
-decoration: BoxDecoration(
-  border: Border(
-    top: BorderSide(color: AppTheme.primaryOrange, width: 3),
-    left: BorderSide(color: AppTheme.primaryOrange, width: 3),
-  ),
-),
+                      decoration: BoxDecoration(
+                        border: Border(
+                          top: BorderSide(color: AppTheme.primaryOrange, width: 3),
+                          left: BorderSide(color: AppTheme.primaryOrange, width: 3),
+                        ),
+                      ),
                     ),
                   ),
                   Positioned(
@@ -113,12 +117,12 @@ decoration: BoxDecoration(
                     child: Container(
                       width: 30,
                       height: 30,
-decoration: BoxDecoration(
-  border: Border(
-    top: BorderSide(color: AppTheme.primaryOrange, width: 3),
-    right: BorderSide(color: AppTheme.primaryOrange, width: 3),
-  ),
-),
+                      decoration: BoxDecoration(
+                        border: Border(
+                          top: BorderSide(color: AppTheme.primaryOrange, width: 3),
+                          right: BorderSide(color: AppTheme.primaryOrange, width: 3),
+                        ),
+                      ),
                     ),
                   ),
                   Positioned(
@@ -127,12 +131,12 @@ decoration: BoxDecoration(
                     child: Container(
                       width: 30,
                       height: 30,
-decoration: BoxDecoration(
-  border: Border(
-    bottom: BorderSide(color: AppTheme.primaryOrange, width: 3),
-    left: BorderSide(color: AppTheme.primaryOrange, width: 3),
-  ),
-),
+                      decoration: BoxDecoration(
+                        border: Border(
+                          bottom: BorderSide(color: AppTheme.primaryOrange, width: 3),
+                          left: BorderSide(color: AppTheme.primaryOrange, width: 3),
+                        ),
+                      ),
                     ),
                   ),
                   Positioned(
@@ -141,12 +145,12 @@ decoration: BoxDecoration(
                     child: Container(
                       width: 30,
                       height: 30,
-decoration: BoxDecoration(
-  border: Border(
-    bottom: BorderSide(color: AppTheme.primaryOrange, width: 3),
-    right: BorderSide(color: AppTheme.primaryOrange, width: 3),
-  ),
-),
+                      decoration: BoxDecoration(
+                        border: Border(
+                          bottom: BorderSide(color: AppTheme.primaryOrange, width: 3),
+                          right: BorderSide(color: AppTheme.primaryOrange, width: 3),
+                        ),
+                      ),
                     ),
                   ),
                 ],
@@ -205,6 +209,107 @@ decoration: BoxDecoration(
             ),
         ],
       ),
+    );
+  }
+
+  Widget _buildScannerBody() {
+    if (_isPreparingCamera) {
+      return const Center(
+        child: CircularProgressIndicator(),
+      );
+    }
+
+    if (_cameraErrorMessage != null) {
+      return Container(
+        color: Colors.black,
+        padding: const EdgeInsets.all(24),
+        child: Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(
+                Icons.camera_alt_outlined,
+                color: Colors.white70,
+                size: 52,
+              ),
+              const SizedBox(height: 16),
+              Text(
+                _cameraErrorMessage!,
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 15,
+                ),
+              ),
+              const SizedBox(height: 16),
+              Wrap(
+                spacing: 12,
+                runSpacing: 12,
+                alignment: WrapAlignment.center,
+                children: [
+                  ElevatedButton(
+                    onPressed: _prepareCamera,
+                    child: const Text('Try Again'),
+                  ),
+                  if (_cameraErrorMessage!.contains('Settings'))
+                    OutlinedButton(
+                      onPressed: openAppSettings,
+                      child: const Text('Open Settings'),
+                    ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    return MobileScanner(
+      controller: _controller,
+      onDetect: (BarcodeCapture capture) {
+        if (_hasDetectedBarcode) return;
+
+        final List<Barcode> barcodes = capture.barcodes;
+        for (final barcode in barcodes) {
+          final String? code = barcode.rawValue?.trim();
+          if (code != null && code.isNotEmpty) {
+            if (_lastScannedBarcode == code) {
+              return;
+            }
+
+            setState(() {
+              _lastScannedBarcode = code;
+              _hasDetectedBarcode = true;
+            });
+
+            HapticFeedback.lightImpact();
+
+            Future.delayed(const Duration(milliseconds: 300), () {
+              if (mounted) {
+                Navigator.of(context).pop(code);
+              }
+            });
+            break;
+          }
+        }
+      },
+      errorBuilder: (context, error) {
+        if (mounted) {
+          setState(() {
+            _cameraErrorMessage = 'Could not start camera: ${error.toString()}';
+          });
+        }
+        return Container(
+          color: Colors.black,
+          child: const Center(
+            child: Text(
+              'Camera error occurred',
+              style: TextStyle(color: Colors.white),
+            ),
+          ),
+        );
+      },
+      fit: BoxFit.cover,
     );
   }
 }

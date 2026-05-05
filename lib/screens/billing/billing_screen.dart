@@ -1,10 +1,10 @@
 import 'dart:async';
+import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:focus_swiftbill/services/database_service.dart';
 import 'package:focus_swiftbill/services/auth_service.dart';
 import 'package:focus_swiftbill/services/api_service.dart';
-import 'package:focus_swiftbill/services/product_sync_service.dart';
 import 'package:focus_swiftbill/services/session_service.dart';
 import 'package:focus_swiftbill/services/scanner_service.dart';
 import 'package:focus_swiftbill/models/product.dart';
@@ -20,13 +20,17 @@ import 'package:focus_swiftbill/screens/camera_scanner/camera_scanner_screen.dar
 import 'package:focus_swiftbill/providers/navigation_provider.dart';
 
 class BillingScreen extends StatefulWidget {
-  const BillingScreen({super.key});
+  BillingScreen({super.key});
 
   @override
   State<BillingScreen> createState() => _BillingScreenState();
 }
 
 class _BillingScreenState extends State<BillingScreen> {
+  static const String _companyIdKey = 'selected_company_id';
+  static const int _productsPageSize = 20;
+  static const int _priceDetailsBatchSize = 12;
+
   final AuthService _auth = AuthService();
   final SessionService _session = SessionService();
   final TextEditingController _searchController = TextEditingController();
@@ -34,6 +38,15 @@ class _BillingScreenState extends State<BillingScreen> {
   final TextEditingController _memberNameController = TextEditingController();
   final TextEditingController _memberPhoneController = TextEditingController();
   final ScrollController _productsScrollController = ScrollController();
+  final Dio _billingApiDio = Dio(
+    BaseOptions(
+      connectTimeout: const Duration(seconds: 15),
+      receiveTimeout: const Duration(seconds: 15),
+      headers: const {
+        'Accept': 'application/json',
+      },
+    ),
+  );
 
   // Focus node for RawKeyboardListener (hardware scanner)
   final FocusNode _keyboardFocusNode = FocusNode();
@@ -45,14 +58,18 @@ class _BillingScreenState extends State<BillingScreen> {
   String _selectedCategory = 'All';
   List<String> _categories = ['All'];
   int _cartItemCount = 0;
-  double _cartTotal = 0;
+  double _cartSubtotal = 0;
+  double _cartTaxTotal = 0;
+  double _cartGrandTotal = 0;
   final ValueNotifier<int> _cartVersion = ValueNotifier<int>(0);
   Timer? _productSyncTimer;
   bool _isLoadingProducts = true;
   bool _isRefreshingProducts = false;
-  int _visibleProductCount = ProductSyncService.pageSize;
+  int _visibleProductCount = _productsPageSize;
+  static const int _stockInfoBatchSize = 100;
   final Map<String, ProductStockInfo> _productStockInfoById = {};
   final Set<String> _loadingProductStockIds = <String>{};
+  final Set<String> _loadingProductPriceIds = <String>{};
 
   ScannerService? _scannerService;
   String? _activeScanner;
@@ -144,10 +161,7 @@ class _BillingScreenState extends State<BillingScreen> {
 
   Future<void> _syncProductsIfDue() async {
     try {
-      final result = await ProductSyncService().ensureProductsLoaded();
-      if (result.usedRemoteData && mounted) {
-        await _loadProducts();
-      }
+      await _loadProducts(syncWithApi: true);
     } catch (_) {
       // Keep cached products on scheduled sync failure.
     }
@@ -167,10 +181,10 @@ class _BillingScreenState extends State<BillingScreen> {
   void _loadMoreProducts() {
     if (!_hasMoreProducts) return;
     setState(() {
-      _visibleProductCount = (_visibleProductCount + ProductSyncService.pageSize)
+      _visibleProductCount = (_visibleProductCount + _productsPageSize)
           .clamp(0, _filteredProducts.length);
     });
-    _fetchVisibleProductStockInfo();
+    unawaited(_fetchVisibleProductPricing(_filteredProducts));
   }
 
   void _filterProducts() {
@@ -188,16 +202,19 @@ class _BillingScreenState extends State<BillingScreen> {
       _filteredProducts = filteredProducts;
       _visibleProductCount = filteredProducts.isEmpty
           ? 0
-          : filteredProducts.length < ProductSyncService.pageSize
+          : filteredProducts.length < _productsPageSize
               ? filteredProducts.length
-              : ProductSyncService.pageSize;
+              : _productsPageSize;
     });
-    _fetchVisibleProductStockInfo();
+    unawaited(_fetchVisibleProductPricing(filteredProducts));
   }
 
-  Future<void> _fetchVisibleProductStockInfo({bool forceRefresh = false}) async {
+  Future<void> _fetchProductStockInfo(
+    List<Product> products, {
+    bool forceRefresh = false,
+  }) async {
     final idsToLoad = <String>[];
-    for (final product in _visibleProducts) {
+    for (final product in products) {
       final productId = product.id.trim();
       if (productId.isEmpty || _loadingProductStockIds.contains(productId)) {
         continue;
@@ -220,9 +237,17 @@ class _BillingScreenState extends State<BillingScreen> {
 
     _loadingProductStockIds.addAll(idsToLoad);
     try {
-      final stockInfo = await ApiService().getStockInformationByProductIds(
-        idsToLoad,
-      );
+      final stockInfo = <String, ProductStockInfo>{};
+      for (var index = 0; index < idsToLoad.length; index += _stockInfoBatchSize) {
+        final batch = idsToLoad
+            .skip(index)
+            .take(_stockInfoBatchSize)
+            .toList();
+        final batchStockInfo = await ApiService().getStockInformationByProductIds(
+          batch,
+        );
+        stockInfo.addAll(batchStockInfo);
+      }
       if (!mounted) return;
       setState(() {
         _productStockInfoById.addAll(stockInfo);
@@ -230,17 +255,11 @@ class _BillingScreenState extends State<BillingScreen> {
           final liveInfo = stockInfo[product.id];
           if (liveInfo == null) continue;
           product.stockQty = liveInfo.availableStockQty;
-          if (liveInfo.avgRate > 0) {
-            product.price = liveInfo.avgRate;
-          }
         }
         for (final item in _cart) {
           final liveInfo = stockInfo[item.product.id];
           if (liveInfo == null) continue;
           item.product.stockQty = liveInfo.availableStockQty;
-          if (liveInfo.avgRate > 0) {
-            item.product.price = liveInfo.avgRate;
-          }
         }
         _sortProductsByAvailability();
         _updateTotals();
@@ -270,35 +289,24 @@ class _BillingScreenState extends State<BillingScreen> {
 
     if (syncWithApi || forceRefresh) {
       try {
-        final result = await ProductSyncService().ensureProductsLoaded(
-          forceRefresh: forceRefresh,
-        );
+        final products = await _fetchBillingProductsFromApi();
+        await DatabaseService.replaceProducts(products);
         if (forceRefresh && mounted) {
-          final message = result.usedRemoteData
+          final message = products.isNotEmpty
               ? 'Products refreshed successfully'
-              : 'Products are already up to date';
+              : 'No products were returned';
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
-              content: Text('$message (${result.productCount} items available)'),
+              content: Text('$message (${products.length} items available)'),
               behavior: SnackBarBehavior.floating,
             ),
           );
         }
-      } on ApiException catch (e) {
+      } catch (e) {
         if (forceRefresh && mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
-              content: Text(e.message),
-              behavior: SnackBarBehavior.floating,
-              backgroundColor: Colors.redAccent,
-            ),
-          );
-        }
-      } catch (_) {
-        if (forceRefresh && mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text('Unable to refresh products right now'),
+              content: Text(_friendlyBillingLoadError(e)),
               behavior: SnackBarBehavior.floating,
               backgroundColor: Colors.redAccent,
             ),
@@ -328,6 +336,7 @@ class _BillingScreenState extends State<BillingScreen> {
       _isLoadingProducts = false;
       if (forceRefresh) {
         _productStockInfoById.clear();
+        _loadingProductPriceIds.clear();
       }
     });
     _filterProducts();
@@ -360,7 +369,9 @@ class _BillingScreenState extends State<BillingScreen> {
 
   void _updateTotals() {
     _cartItemCount = _cart.fold(0, (sum, item) => sum + item.quantity);
-    _cartTotal = _cart.fold(0, (sum, item) => sum + item.total);
+    _cartSubtotal = _cart.fold(0, (sum, item) => sum + item.total);
+    _cartTaxTotal = _cart.fold(0, (sum, item) => sum + _itemTaxAmount(item));
+    _cartGrandTotal = _cartSubtotal + _cartTaxTotal;
     _cartVersion.value++;
   }
 
@@ -370,8 +381,19 @@ class _BillingScreenState extends State<BillingScreen> {
   }
 
   double _effectiveUnitPrice(Product product) {
-    final livePrice = _productStockInfoById[product.id]?.avgRate ?? 0;
-    return livePrice > 0 ? livePrice : product.price;
+    return product.price;
+  }
+
+  double _productTaxRate(Product product) {
+    return product.taxRate < 0 ? 0 : product.taxRate;
+  }
+
+  double _itemTaxAmount(CartItem item) {
+    return item.total * (_productTaxRate(item.product) / 100);
+  }
+
+  String _formatPercentage(double value) {
+    return value % 1 == 0 ? value.toStringAsFixed(0) : value.toStringAsFixed(2);
   }
 
   int _compareProductsByAvailability(Product a, Product b) {
@@ -392,7 +414,274 @@ class _BillingScreenState extends State<BillingScreen> {
     return value % 1 == 0 ? value.toStringAsFixed(0) : value.toStringAsFixed(2);
   }
 
+  String get _currencyLabel {
+    for (final item in _cart) {
+      final code = item.product.currencyCode.trim();
+      if (code.isNotEmpty) {
+        return code;
+      }
+    }
+    for (final product in _products) {
+      final code = product.currencyCode.trim();
+      if (code.isNotEmpty) {
+        return code;
+      }
+    }
+    return AppConstants.currencySymbol;
+  }
+
+  String _friendlyBillingLoadError(Object error) {
+    final message = error.toString();
+    if (message.toLowerCase().contains('company')) {
+      return 'Select a company before loading products.';
+    }
+    if (message.toLowerCase().contains('base url')) {
+      return 'Set the API URL before loading products.';
+    }
+    return 'Unable to load billing products right now.';
+  }
+
+  String _trimTrailingSlash(String value) {
+    final normalized = value.trim();
+    if (normalized.endsWith('/')) {
+      return normalized.substring(0, normalized.length - 1);
+    }
+    return normalized;
+  }
+
+  String _billingApiRootFromBaseUrl(String baseUrl) {
+    final normalizedBaseUrl = _trimTrailingSlash(baseUrl);
+    final lower = normalizedBaseUrl.toLowerCase();
+    const marker = '/focus8api';
+    final markerIndex = lower.indexOf(marker);
+    final hostRoot = markerIndex >= 0
+        ? normalizedBaseUrl.substring(0, markerIndex)
+        : normalizedBaseUrl;
+    return '$hostRoot/pillayrpos/api/products';
+  }
+
+  Future<String> _getSelectedCompanyId() async {
+    final prefs = await SharedPreferences.getInstance();
+    final companyId = prefs.getString(_companyIdKey)?.trim() ?? '';
+    if (companyId.isEmpty) {
+      throw Exception('No company selected');
+    }
+    return companyId;
+  }
+
+  Future<String> _getBillingApiRoot() async {
+    final savedBaseUrl = await ApiService().getSavedBaseUrl();
+    final normalizedBaseUrl = _trimTrailingSlash(savedBaseUrl);
+    if (normalizedBaseUrl.isEmpty) {
+      throw Exception('Missing base URL');
+    }
+    return _billingApiRootFromBaseUrl(normalizedBaseUrl);
+  }
+
+  Future<List<Product>> _fetchBillingProductsFromApi() async {
+    final companyId = await _getSelectedCompanyId();
+    final apiRoot = await _getBillingApiRoot();
+    final response = await _billingApiDio.get(
+      '$apiRoot/productmaster',
+      queryParameters: {'compid': companyId},
+    );
+
+    final rows = _extractBillingRows(response.data);
+    final products = rows
+        .map(_mapBillingProductRow)
+        .where((product) => product.id.trim().isNotEmpty && product.name.trim().isNotEmpty)
+        .toList()
+      ..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+
+    return products;
+  }
+
+  List<Map<String, dynamic>> _extractBillingRows(dynamic responseData) {
+    if (responseData is Map) {
+      final rows = responseData['datalist'];
+      if (rows is List) {
+        return rows.whereType<Map>().map((row) => Map<String, dynamic>.from(row)).toList();
+      }
+    }
+    return const [];
+  }
+
+  int _parseIntValue(dynamic value) {
+    if (value is int) {
+      return value;
+    }
+    if (value is num) {
+      return value.toInt();
+    }
+    return int.tryParse(value?.toString() ?? '') ?? 0;
+  }
+
+  double _parseDoubleValue(dynamic value) {
+    if (value is num) {
+      return value.toDouble();
+    }
+    return double.tryParse(value?.toString() ?? '') ?? 0;
+  }
+
+  Product _mapBillingProductRow(Map<String, dynamic> row) {
+    final rawQty = _parseIntValue(row['Qty']);
+    final stockAvailability = row['StockAvailability']?.toString().trim().toLowerCase() == 'yes';
+    final normalizedQty = rawQty > 0 ? rawQty : (stockAvailability ? 1 : 0);
+    final barcode = row['barcode']?.toString().trim() ?? '';
+    final itemCode = row['itemcode']?.toString().trim() ?? '';
+
+    return Product(
+      id: row['Id']?.toString() ?? '',
+      name: row['product']?.toString().trim() ?? '',
+      barcode: barcode.isNotEmpty ? barcode : itemCode,
+      price: 0,
+      costPrice: 0,
+      stockQty: normalizedQty,
+      category: 'General',
+      isActive: true,
+      taxRate: 0,
+      currencyCode: '',
+    );
+  }
+
+  Future<void> _fetchVisibleProductPricing(
+    List<Product> products, {
+    bool forceRefresh = false,
+  }) async {
+    if (products.isEmpty || _visibleProductCount == 0) {
+      return;
+    }
+
+    final visibleProducts =
+        products.take(_visibleProductCount.clamp(0, products.length)).toList();
+    final productsToLoad = visibleProducts.where((product) {
+      if (product.id.trim().isEmpty || _loadingProductPriceIds.contains(product.id)) {
+        return false;
+      }
+      if (forceRefresh) {
+        return true;
+      }
+      return product.price <= 0 && product.currencyCode.trim().isEmpty && product.taxRate <= 0;
+    }).toList();
+
+    if (productsToLoad.isEmpty) {
+      return;
+    }
+
+    try {
+      final companyId = await _getSelectedCompanyId();
+      final apiRoot = await _getBillingApiRoot();
+      _loadingProductPriceIds.addAll(productsToLoad.map((product) => product.id));
+
+      final updates = <String, _BillingPriceDetails>{};
+      for (var index = 0; index < productsToLoad.length; index += _priceDetailsBatchSize) {
+        final batch = productsToLoad.skip(index).take(_priceDetailsBatchSize).toList();
+        final batchResults = await Future.wait(
+          batch.map((product) async {
+            final details = await _fetchProductPriceDetails(
+              apiRoot: apiRoot,
+              companyId: companyId,
+              itemId: product.id,
+            );
+            return MapEntry(product.id, details);
+          }),
+        );
+        for (final entry in batchResults) {
+          if (entry.value != null) {
+            updates[entry.key] = entry.value!;
+          }
+        }
+      }
+
+      if (updates.isEmpty || !mounted) {
+        return;
+      }
+
+      final productsBox = DatabaseService.getProducts();
+      setState(() {
+        for (final product in _products) {
+          final details = updates[product.id];
+          if (details == null) continue;
+          product.price = details.price;
+          product.taxRate = details.taxRate;
+          product.currencyCode = details.currencyCode;
+          unawaited(productsBox.put(product.id, product));
+        }
+
+        for (final item in _cart) {
+          final details = updates[item.product.id];
+          if (details == null) continue;
+          item.product.price = details.price;
+          item.product.taxRate = details.taxRate;
+          item.product.currencyCode = details.currencyCode;
+        }
+
+        _updateTotals();
+      });
+    } catch (error) {
+      debugPrint('Unable to load billing product prices: $error');
+    } finally {
+      _loadingProductPriceIds.removeAll(productsToLoad.map((product) => product.id));
+    }
+  }
+
+  Future<_BillingPriceDetails?> _fetchProductPriceDetails({
+    required String apiRoot,
+    required String companyId,
+    required String itemId,
+  }) async {
+    final response = await _billingApiDio.get(
+      '$apiRoot/sellingmaster',
+      queryParameters: {
+        'compid': companyId,
+        'itemid': itemId,
+      },
+    );
+
+    final rows = _extractBillingRows(response.data);
+    if (rows.isEmpty) {
+      return null;
+    }
+
+    final row = rows.first;
+    return _BillingPriceDetails(
+      price: _parseDoubleValue(row['SellingPrice']),
+      taxRate: _parseDoubleValue(row['tax']),
+      currencyCode: row['currency']?.toString().trim() ?? '',
+    );
+  }
+
+  Future<void> _ensureProductPricingLoaded(Product product) async {
+    final alreadyLoaded = product.price > 0 ||
+        product.currencyCode.trim().isNotEmpty ||
+        product.taxRate > 0;
+    if (alreadyLoaded) {
+      return;
+    }
+
+    try {
+      final companyId = await _getSelectedCompanyId();
+      final apiRoot = await _getBillingApiRoot();
+      final details = await _fetchProductPriceDetails(
+        apiRoot: apiRoot,
+        companyId: companyId,
+        itemId: product.id,
+      );
+      if (details == null) {
+        return;
+      }
+
+      product.price = details.price;
+      product.taxRate = details.taxRate;
+      product.currencyCode = details.currencyCode;
+      unawaited(DatabaseService.getProducts().put(product.id, product));
+    } catch (error) {
+      debugPrint('Unable to load product pricing for ${product.id}: $error');
+    }
+  }
+
   Future<void> _addToCart(Product product) async {
+    await _ensureProductPricingLoaded(product);
     final cartBox = DatabaseService.getCart();
     final existingIdx = _cart.indexWhere((c) => c.product.id == product.id);
     final availableStock = _availableStockQty(product);
@@ -491,8 +780,13 @@ class _BillingScreenState extends State<BillingScreen> {
   }
 
   Future<void> _addProductByBarcode(String barcode) async {
+    final normalizedBarcode = barcode.trim();
     try {
-      final product = _products.firstWhere((p) => p.barcode == barcode);
+      final product = _products.firstWhere(
+        (p) =>
+            p.barcode.trim() == normalizedBarcode ||
+            p.id.trim() == normalizedBarcode,
+      );
       await _addToCart(product);
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -507,7 +801,7 @@ class _BillingScreenState extends State<BillingScreen> {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Product not found: $barcode'),
+            content: Text('Product not found: $normalizedBarcode'),
             duration: const Duration(milliseconds: 1500),
             behavior: SnackBarBehavior.floating,
           ),
@@ -558,7 +852,6 @@ class _BillingScreenState extends State<BillingScreen> {
     await _addProductByBarcode(result);
   }
 }
-
   Future<void> _showAddMemberDialog() async {
     _memberNameController.clear();
     _memberPhoneController.clear();
@@ -749,7 +1042,7 @@ class _BillingScreenState extends State<BillingScreen> {
     final inStock = availableStock > 0;
     final cartQty = getCartQuantity(product);
     final canAdd = inStock && cartQty < availableStock;
-    final lineTotal = unitPrice * cartQty;
+    final taxLabel = _formatPercentage(_productTaxRate(product));
 
     return GestureDetector(
       onTap: () {
@@ -845,18 +1138,12 @@ class _BillingScreenState extends State<BillingScreen> {
                     ),
                     const SizedBox(height: 2),
                     Text(
-                      '${AppConstants.currencySymbol}${unitPrice.toStringAsFixed(2)}',
+                      '$_currencyLabel${unitPrice.toStringAsFixed(2)}',
                       style: const TextStyle(color: AppTheme.primaryOrange, fontWeight: FontWeight.w700, fontSize: 12),
                     ),
+                    
                     const SizedBox(height: 2),
-                    Text(
-                      'Qty: ${stockInfo != null ? _formatProductMetric(stockInfo.quantity) : '$availableStock'}',
-                      style: TextStyle(
-                        fontSize: 9.5,
-                        fontWeight: FontWeight.w600,
-                        color: inStock ? Colors.grey.shade700 : Colors.red.shade300,
-                      ),
-                    ),
+                    
                     
                     const Spacer(),
                     Row(
@@ -908,16 +1195,7 @@ class _BillingScreenState extends State<BillingScreen> {
                           const SizedBox(width: 20, height: 20),
                       ],
                     ),
-                    if (cartQty > 0) ...[
-                      const SizedBox(height: 2),
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          const Text('Total', style: TextStyle(fontSize: 9, color: Colors.grey)),
-                          Text('${AppConstants.currencySymbol}${lineTotal.toStringAsFixed(2)}', style: const TextStyle(fontSize: 10, fontWeight: FontWeight.w700, color: Colors.green)),
-                        ],
-                      ),
-                    ],
+                    
                   ],
                 ),
               ),
@@ -995,7 +1273,10 @@ class _BillingScreenState extends State<BillingScreen> {
                             child: Icon(Icons.inventory_2, size: 20, color: AppTheme.primaryOrange),
                           ),
                           title: Text(item.product.name, style: const TextStyle(fontWeight: FontWeight.w500, fontSize: 13), maxLines: 1, overflow: TextOverflow.ellipsis),
-                          subtitle: Text('${AppConstants.currencySymbol}${item.product.price.toStringAsFixed(2)}', style: const TextStyle(fontSize: 11)),
+                          subtitle: Text(
+                            '$_currencyLabel${item.product.price.toStringAsFixed(2)} • Tax ${_formatPercentage(_productTaxRate(item.product))}%',
+                            style: const TextStyle(fontSize: 11),
+                          ),
                           trailing: Row(
                             mainAxisSize: MainAxisSize.min,
                             children: [
@@ -1031,15 +1312,15 @@ class _BillingScreenState extends State<BillingScreen> {
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
                       const Text('Subtotal', style: TextStyle(fontSize: 13)),
-                      Text('${AppConstants.currencySymbol}${_cartTotal.toStringAsFixed(2)}', style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+                      Text('$_currencyLabel${_cartSubtotal.toStringAsFixed(2)}', style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
                     ],
                   ),
                   const SizedBox(height: 4),
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
-                      const Text('Tax (18%)', style: TextStyle(fontSize: 12, color: Colors.grey)),
-                      Text('${AppConstants.currencySymbol}${(_cartTotal * 0.1).toStringAsFixed(2)}', style: const TextStyle(fontSize: 12)),
+                      const Text('Tax', style: TextStyle(fontSize: 12, color: Colors.grey)),
+                      Text('$_currencyLabel${_cartTaxTotal.toStringAsFixed(2)}', style: const TextStyle(fontSize: 12)),
                     ],
                   ),
                   const Divider(height: 12),
@@ -1048,7 +1329,7 @@ class _BillingScreenState extends State<BillingScreen> {
                     children: [
                       const Text('Total', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
                       Text(
-                        '${AppConstants.currencySymbol}${(_cartTotal * 1.1).toStringAsFixed(2)}',
+                        '$_currencyLabel${_cartGrandTotal.toStringAsFixed(2)}',
                         style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: AppTheme.primaryOrange),
                       ),
                     ],
@@ -1261,4 +1542,16 @@ class _BillingScreenState extends State<BillingScreen> {
       ),
     );
   }
+}
+
+class _BillingPriceDetails {
+  const _BillingPriceDetails({
+    required this.price,
+    required this.taxRate,
+    required this.currencyCode,
+  });
+
+  final double price;
+  final double taxRate;
+  final String currencyCode;
 }

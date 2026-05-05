@@ -32,6 +32,12 @@ class Product extends HiveObject {
   @HiveField(8)
   bool isActive;
 
+  @HiveField(9)
+  double taxRate;
+
+  @HiveField(10)
+  String currencyCode;
+
   Product({
     required this.id,
     required this.name,
@@ -42,6 +48,8 @@ class Product extends HiveObject {
     required this.category,
     this.imageUrl,
     required this.isActive,
+    this.taxRate = 0,
+    this.currencyCode = '',
   });
 
   factory Product.fromJson(Map<String, dynamic> json) => Product(
@@ -75,6 +83,14 @@ class Product extends HiveObject {
           const ['isActive', 'IsActive', 'active', 'Active'],
           fallback: true,
         ),
+        taxRate: _firstDouble(
+          json,
+          const ['taxRate', 'TaxRate', 'tax', 'Tax', 'Val1'],
+        ),
+        currencyCode: _firstString(
+          json,
+          const ['currencyCode', 'CurrencyCode', 'currency', 'Currency', 'Currency__Code'],
+        ),
       );
 
   factory Product.fromApiMap(Map<String, dynamic> json) => Product(
@@ -89,6 +105,8 @@ class Product extends HiveObject {
             'itemCode',
             'ProductId',
             'productId',
+            'ProductId__Id',
+            'ProductId__Code',
             'MasterId',
             'masterId',
             'iMasterId',
@@ -111,6 +129,7 @@ class Product extends HiveObject {
             'itemName',
             'sName',
             'DisplayName',
+            'ProductId__Name',
           ],
         ),
         barcode: _firstString(
@@ -124,6 +143,7 @@ class Product extends HiveObject {
             'EanCode',
             'UPC',
             'upc',
+            'ProductId__Code',
           ],
           fallback: '',
         ),
@@ -142,6 +162,7 @@ class Product extends HiveObject {
             'salesRate',
             'RetailPrice',
             'retailPrice',
+            'Val0',
           ],
         ),
         costPrice: _firstDouble(
@@ -167,6 +188,7 @@ class Product extends HiveObject {
               'mrp',
               'SellingPrice',
               'sellingPrice',
+              'Val0',
             ],
           ),
         ),
@@ -197,6 +219,8 @@ class Product extends HiveObject {
             'department',
             'ParentName',
             'parentName',
+            'PriceBookName',
+            'Abbrevtion',
           ],
           fallback: 'General',
         ),
@@ -206,8 +230,16 @@ class Product extends HiveObject {
         ),
         isActive: _firstBool(
           json,
-          const ['isActive', 'IsActive', 'Active', 'active', 'Status', 'status'],
+          const ['isActive', 'IsActive', 'Active', 'active', 'Status', 'status', 'bActive'],
           fallback: true,
+        ),
+        taxRate: _firstDouble(
+          json,
+          const ['taxRate', 'TaxRate', 'Tax', 'tax', 'Val1'],
+        ),
+        currencyCode: _firstString(
+          json,
+          const ['currencyCode', 'CurrencyCode', 'currency', 'Currency', 'Currency__Code'],
         ),
       );
 
@@ -221,6 +253,8 @@ class Product extends HiveObject {
         'category': category,
         'imageUrl': imageUrl,
         'isActive': isActive,
+        'taxRate': taxRate,
+        'currencyCode': currencyCode,
       };
 
   static String _firstString(

@@ -36,7 +36,7 @@ class AppConstants {
   static const double taxRate = 0.18; // 10% GST
   
   // Currency
-  static const String currencySymbol = 'Ksh';
+  static const String currencySymbol = '';
 
   // Discount
   static const double maxDiscountPercentage = 0.25; // 25% max

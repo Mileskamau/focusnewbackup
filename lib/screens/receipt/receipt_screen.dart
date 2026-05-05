@@ -5,12 +5,23 @@ import 'package:focus_swiftbill/theme/app_theme.dart';
 import 'package:focus_swiftbill/utils/constants.dart';
 import 'package:focus_swiftbill/providers/navigation_provider.dart';
 import 'package:focus_swiftbill/providers/data_refresh_provider.dart';
+import 'package:focus_swiftbill/screens/receipt/receipt_print_screen.dart';
 
 class ReceiptScreen extends StatelessWidget {
   final Order order;
   final double change;
 
   const ReceiptScreen({super.key, required this.order, required this.change});
+
+  String get _currencyLabel {
+    for (final item in order.items) {
+      final code = item.product.currencyCode.trim();
+      if (code.isNotEmpty) {
+        return code;
+      }
+    }
+    return AppConstants.currencySymbol;
+  }
 
   void _goToDashboard(BuildContext context) {
     Provider.of<DataRefreshProvider>(context, listen: false).refresh();
@@ -47,10 +58,12 @@ class ReceiptScreen extends StatelessWidget {
             IconButton(
               icon: const Icon(Icons.print),
               onPressed: () {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(
-                    content: Text('Print feature coming soon'),
-                    behavior: SnackBarBehavior.floating,
+                Navigator.of(context).push(
+                  MaterialPageRoute(
+                    builder: (context) => ReceiptPrintScreen(
+                      order: order,
+                      change: change,
+                    ),
                   ),
                 );
               },
@@ -180,7 +193,7 @@ class ReceiptScreen extends StatelessWidget {
                                     ),
                                   ),
                                   Text(
-                                    '${AppConstants.currencySymbol}${item.total.toStringAsFixed(2)}',
+                                    '$_currencyLabel${item.total.toStringAsFixed(2)}',
                                     style: TextStyle(fontSize: smallFont),
                                   ),
                                 ],
@@ -234,7 +247,7 @@ class ReceiptScreen extends StatelessWidget {
                                   style: TextStyle(fontSize: smallFont),
                                 ),
                                 Text(
-                                  '${AppConstants.currencySymbol}${change.toStringAsFixed(2)}',
+                                  '$_currencyLabel${change.toStringAsFixed(2)}',
                                   style: TextStyle(
                                     fontWeight: FontWeight.bold,
                                     color: Colors.green,
@@ -335,7 +348,7 @@ class ReceiptScreen extends StatelessWidget {
           ),
         ),
         Text(
-          '${AppConstants.currencySymbol}${amount.toStringAsFixed(2)}',
+          '$_currencyLabel${amount.toStringAsFixed(2)}',
           style: TextStyle(
             fontWeight: isBold ? FontWeight.bold : FontWeight.normal,
             fontSize: isLarge ? fontSize + 2 : fontSize,

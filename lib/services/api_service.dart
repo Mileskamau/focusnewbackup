@@ -191,7 +191,7 @@ class ApiService {
       final data = response.data;
       if (data is! Map) {
         throw ApiException(
-          message: 'Unexpected login response from server',
+          message: 'We received an unexpected response while signing you in. Please try again.',
           code: -1,
         );
       }
@@ -209,16 +209,14 @@ class ApiService {
 
       final message = data['message']?.toString().trim();
       throw ApiException(
-        message: message != null && message.isNotEmpty
-            ? message
-            : 'Incorrect username or password',
+        message: _friendlyLoginMessage(message),
         code: result is int ? result : -1,
         response: response,
       );
     } on DioException catch (e) {
       if (e.response?.statusCode == 401 || e.response?.statusCode == 403) {
         throw ApiException(
-          message: 'Incorrect username or password',
+          message: 'The username or password you entered is incorrect.',
           code: e.response?.statusCode ?? -1,
           response: e.response,
         );
@@ -259,6 +257,18 @@ class ApiService {
         '/Screen/CoreMasters/Products',
         queryParameters: queryParameters.isNotEmpty ? queryParameters : null,
       );
+      return _handleResponse(response);
+    } on DioException catch (e) {
+      throw _handleDioError(e);
+    }
+  }
+
+  /// Get seller price book products
+  /// GET /List/CoreMasters/SellerPriceBook
+  Future<List<dynamic>> getSellerPriceBookProducts() async {
+    try {
+      await _ensureInitialized();
+      final response = await _dio.get('/List/CoreMasters/SellerPriceBook');
       return _handleResponse(response);
     } on DioException catch (e) {
       throw _handleDioError(e);
@@ -493,17 +503,36 @@ class ApiService {
 
   /// Handle Dio errors
   ApiException _handleDioError(DioException error) {
+    if (error.type == DioExceptionType.connectionTimeout ||
+        error.type == DioExceptionType.sendTimeout ||
+        error.type == DioExceptionType.receiveTimeout) {
+      return ApiException(
+        message: 'The server is taking too long to respond. Please try again.',
+        code: -1,
+      );
+    }
+
+    if (error.type == DioExceptionType.connectionError) {
+      return ApiException(
+        message: 'We could not reach the server. Check your internet connection and try again.',
+        code: -1,
+      );
+    }
+
     if (error.response != null) {
       final statusCode = error.response!.statusCode;
       final data = error.response!.data;
-      String message = 'Network error';
+      String message = 'Something went wrong while talking to the server.';
 
       if (data is Map) {
-        message = data['message'] ?? 'Request failed';
+        message = _friendlyServerMessage(
+          data['message']?.toString(),
+          statusCode: statusCode,
+        );
       } else if (data is String) {
-        message = data;
+        message = _friendlyServerMessage(data, statusCode: statusCode);
       } else {
-        message = 'Server error (HTTP $statusCode)';
+        message = _friendlyServerMessage(null, statusCode: statusCode);
       }
 
       return ApiException(
@@ -514,10 +543,56 @@ class ApiService {
     } else {
       // No response (timeout, no connection)
       return ApiException(
-        message: 'No internet connection or request timeout',
+        message: 'We could not reach the server. Check your internet connection and try again.',
         code: -1,
       );
     }
+  }
+
+  String _friendlyLoginMessage(String? message) {
+    final normalized = message?.trim().toLowerCase() ?? '';
+    if (normalized.isEmpty ||
+        normalized.contains('incorrect username or password') ||
+        normalized.contains('invalid username') ||
+        normalized.contains('invalid password')) {
+      return 'The username or password you entered is incorrect.';
+    }
+
+    if (normalized.contains('company')) {
+      return 'We could not sign you in for the selected company. Please check your settings and try again.';
+    }
+
+    return message!.trim();
+  }
+
+  String _friendlyServerMessage(String? message, {int? statusCode}) {
+    final trimmedMessage = message?.trim();
+    final normalized = trimmedMessage?.toLowerCase() ?? '';
+
+    if (statusCode == 401 || statusCode == 403) {
+      return 'Your session has expired. Please sign in again.';
+    }
+    if (statusCode == 404) {
+      return 'We could not find what you requested.';
+    }
+    if (statusCode != null && statusCode >= 500) {
+      return 'The server is having trouble right now. Please try again shortly.';
+    }
+
+    if (normalized.isEmpty) {
+      return 'We could not complete your request right now. Please try again.';
+    }
+    if (normalized.contains('incorrect username or password')) {
+      return 'The username or password you entered is incorrect.';
+    }
+    if (normalized.contains('timeout')) {
+      return 'The server is taking too long to respond. Please try again.';
+    }
+    if (normalized.contains('network') || normalized.contains('internet')) {
+      return 'We could not reach the server. Check your internet connection and try again.';
+    }
+
+    return trimmedMessage!;
   }
 }
 
