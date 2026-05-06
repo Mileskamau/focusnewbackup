@@ -1141,7 +1141,15 @@ class _BillingScreenState extends State<BillingScreen> {
                       '$_currencyLabel${unitPrice.toStringAsFixed(2)}',
                       style: const TextStyle(color: AppTheme.primaryOrange, fontWeight: FontWeight.w700, fontSize: 12),
                     ),
-                    
+                    const SizedBox(height: 2),
+                    Text(
+                      'Stock: $availableStock',
+                      style: TextStyle(
+                        color: inStock ? Colors.grey.shade700 : Colors.red.shade400,
+                        fontWeight: FontWeight.w500,
+                        fontSize: 10,
+                      ),
+                    ),
                     const SizedBox(height: 2),
                     
                     
@@ -1260,36 +1268,103 @@ class _BillingScreenState extends State<BillingScreen> {
                     itemCount: _cart.length,
                     itemBuilder: (context, index) {
                       final item = _cart[index];
+                      final lineTotal = item.product.price * item.quantity;
                       return Card(
                         margin: const EdgeInsets.only(bottom: 8),
                         elevation: 0,
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10), side: BorderSide(color: Colors.grey.shade200)),
-                        child: ListTile(
-                          dense: true,
-                          leading: Container(
-                            width: 36,
-                            height: 36,
-                            decoration: BoxDecoration(color: AppTheme.primaryOrange.withOpacity(0.1), borderRadius: BorderRadius.circular(8)),
-                            child: Icon(Icons.inventory_2, size: 20, color: AppTheme.primaryOrange),
-                          ),
-                          title: Text(item.product.name, style: const TextStyle(fontWeight: FontWeight.w500, fontSize: 13), maxLines: 1, overflow: TextOverflow.ellipsis),
-                          subtitle: Text(
-                            '$_currencyLabel${item.product.price.toStringAsFixed(2)} • Tax ${_formatPercentage(_productTaxRate(item.product))}%',
-                            style: const TextStyle(fontSize: 11),
-                          ),
-                          trailing: Row(
-                            mainAxisSize: MainAxisSize.min,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(12),
+                          side: BorderSide(color: Colors.grey.shade200),
+                        ),
+                        child: Padding(
+                          padding: const EdgeInsets.fromLTRB(10, 10, 10, 10),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
-                              IconButton(
-                                icon: const Icon(Icons.remove_circle_outline, size: 18),
-                                onPressed: () => _removeFromCart(item.product),
-                                color: Colors.red,
+                              Row(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Container(
+                                    width: 36,
+                                    height: 36,
+                                    decoration: BoxDecoration(
+                                      color: AppTheme.primaryOrange.withOpacity(0.1),
+                                      borderRadius: BorderRadius.circular(8),
+                                    ),
+                                    child: Icon(Icons.inventory_2, size: 20, color: AppTheme.primaryOrange),
+                                  ),
+                                  const SizedBox(width: 10),
+                                  Expanded(
+                                    child: Column(
+                                      crossAxisAlignment: CrossAxisAlignment.start,
+                                      children: [
+                                        Text(
+                                          item.product.name,
+                                          style: const TextStyle(
+                                            fontWeight: FontWeight.w600,
+                                            fontSize: 13,
+                                            height: 1.25,
+                                          ),
+                                          softWrap: true,
+                                        ),
+                                        const SizedBox(height: 3),
+                                        Text(
+                                          '$_currencyLabel${item.product.price.toStringAsFixed(2)} • Tax ${_formatPercentage(_productTaxRate(item.product))}%',
+                                          style: TextStyle(fontSize: 11, color: Colors.grey.shade600),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ],
                               ),
-                              Text('${item.quantity}', style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13)),
-                              IconButton(
-                                icon: const Icon(Icons.add_circle_outline, size: 18),
-                                onPressed: () => _addToCart(item.product),
-                                color: AppTheme.primaryOrange,
+                              const SizedBox(height: 10),
+                              Row(
+                                children: [
+                                  Container(
+                                    decoration: BoxDecoration(
+                                      color: Colors.grey.shade100,
+                                      borderRadius: BorderRadius.circular(24),
+                                    ),
+                                    child: Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        InkWell(
+                                          onTap: () => _removeFromCart(item.product),
+                                          borderRadius: BorderRadius.circular(24),
+                                          child: const Padding(
+                                            padding: EdgeInsets.all(7),
+                                            child: Icon(Icons.remove, size: 16, color: Colors.red),
+                                          ),
+                                        ),
+                                        Container(
+                                          constraints: const BoxConstraints(minWidth: 30),
+                                          alignment: Alignment.center,
+                                          child: Text(
+                                            '${item.quantity}',
+                                            style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 13),
+                                          ),
+                                        ),
+                                        InkWell(
+                                          onTap: () => _addToCart(item.product),
+                                          borderRadius: BorderRadius.circular(24),
+                                          child: const Padding(
+                                            padding: EdgeInsets.all(7),
+                                            child: Icon(Icons.add, size: 16, color: AppTheme.primaryOrange),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                  const Spacer(),
+                                  Text(
+                                    '$_currencyLabel${lineTotal.toStringAsFixed(2)}',
+                                    style: const TextStyle(
+                                      fontWeight: FontWeight.w700,
+                                      fontSize: 13,
+                                      color: AppTheme.primaryOrange,
+                                    ),
+                                  ),
+                                ],
                               ),
                             ],
                           ),
@@ -1385,7 +1460,7 @@ class _BillingScreenState extends State<BillingScreen> {
                       decoration: InputDecoration(
                         hintText: 'Search or scan',
                         prefixIcon: const Icon(Icons.search, size: 18),
-                        suffixIcon: IconButton(icon: const Icon(Icons.qr_code_scanner, size: 18), onPressed: _showScannerSelection),
+                        suffixIcon: IconButton(icon: const Icon(Icons.qr_code_scanner, size: 18), onPressed: _openCameraScanner),
                         filled: true,
                         fillColor: Colors.grey.shade100,
                         border: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide.none),

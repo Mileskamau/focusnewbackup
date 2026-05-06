@@ -318,7 +318,7 @@ class _LoginScreenState extends State<LoginScreen> {
 
         setState(() {
           _errorMessage =
-              'No connection detected. Use the saved username and password for offline sign-in, or reconnect and try again.';
+              'wrong username or password';
         });
         _showSnackBar(_errorMessage!);
         return;
@@ -387,7 +387,7 @@ class _LoginScreenState extends State<LoginScreen> {
     } catch (_) {
       if (!mounted) return;
       setState(() {
-        _errorMessage = 'We could not sign you in right now. Please try again.';
+        _errorMessage = 'No server connection!!';
       });
       _showSnackBar(_errorMessage!);
     } finally {

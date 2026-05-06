@@ -31,14 +31,10 @@ class ReceiptScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final screenSize = MediaQuery.of(context).size;
-    final isSmallScreen = screenSize.width < 600;
-    final horizontalPadding = isSmallScreen ? 12.0 : 24.0;
-    final cardPadding = isSmallScreen ? 12.0 : 20.0;
-    final headerIconSize = screenSize.width * 0.1; // ~40 on phone
-    final fontSizeBase = isSmallScreen ? 11.0 : 13.0;
-    final smallFont = fontSizeBase - 1;
-    final largeFont = fontSizeBase + 2;
+    const double receiptWidth = 280; // ~80mm POS roll
+    const double baseFont = 9;
+    const double smallFont = 8;
+    const double largeFont = 11;
 
     return PopScope(
       canPop: false,
@@ -68,294 +64,281 @@ class ReceiptScreen extends StatelessWidget {
                 );
               },
             ),
-            IconButton(
-              icon: const Icon(Icons.share),
-              onPressed: () {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(
-                    content: Text('Share feature coming soon'),
-                    behavior: SnackBarBehavior.floating,
-                  ),
-                );
-              },
-            ),
           ],
         ),
-        body: LayoutBuilder(
-          builder: (context, constraints) {
-            return Container(
-              height: constraints.maxHeight,
-              padding: EdgeInsets.symmetric(
-                horizontal: horizontalPadding,
-                vertical: 12.0,
+        body: Center(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            child: Container(
+              width: receiptWidth,
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                border: Border.all(color: Colors.grey.shade300),
               ),
-              child: Card(
-                elevation: 2,
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(16),
-                ),
-                child: Padding(
-                  padding: EdgeInsets.all(cardPadding),
-                  child: Column(
-                    children: [
-                      // ----- Header (Payment Success) -----
-                      Column(
-                        children: [
-                          Container(
-                            padding: EdgeInsets.all(cardPadding * 0.5),
-                            decoration: BoxDecoration(
-                              color: AppTheme.primaryOrange.withOpacity(0.1),
-                              shape: BoxShape.circle,
-                            ),
-                            child: Icon(
-                              Icons.check_circle,
-                              size: headerIconSize,
-                              color: AppTheme.primaryOrange,
-                            ),
-                          ),
-                          const SizedBox(height: 8),
-                          Text(
-                            'Payment Successful',
-                            style: TextStyle(
-                              fontSize: fontSizeBase + 4,
-                              fontWeight: FontWeight.bold,
-                            ),
-                          ),
-                        ],
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Center(
+                    child: Icon(
+                      Icons.check_circle,
+                      size: 18,
+                      color: AppTheme.primaryOrange,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  const Center(
+                    child: Text(
+                      'FOCUS SwiftBill',
+                      style: TextStyle(
+                        fontSize: largeFont,
+                        fontWeight: FontWeight.bold,
                       ),
-                      const SizedBox(height: 12),
-
-                      // ----- Store Info -----
-                      Column(
-                        children: [
-                          Text(
-                            'FOCUS SwiftBill',
-                            style: TextStyle(
-                              fontSize: fontSizeBase + 2,
-                              fontWeight: FontWeight.bold,
-                            ),
-                          ),
-                          const SizedBox(height: 2),
-                          Text(
-                            '123 Main Street, City',
-                            style: TextStyle(
-                              fontSize: smallFont,
-                              color: Colors.grey,
-                            ),
-                          ),
-                          const SizedBox(height: 2),
-                          Text(
-                            'GSTIN: 12ABCDE1234F',
-                            style: TextStyle(
-                              fontSize: smallFont,
-                              color: Colors.grey,
-                            ),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 12),
-
-                      // ----- Order Details -----
-                      _buildInfoRow('Order #', order.orderNumber, fontSizeBase),
-                      const SizedBox(height: 2),
-                      _buildInfoRow(
-                        'Date',
-                        '${order.createdAt.day}/${order.createdAt.month}/${order.createdAt.year}',
-                        fontSizeBase,
-                      ),
-                      const SizedBox(height: 2),
-                      _buildInfoRow(
-                        'Time',
-                        '${order.createdAt.hour}:${order.createdAt.minute.toString().padLeft(2, '0')}',
-                        fontSizeBase,
-                      ),
-                      const SizedBox(height: 2),
-                      _buildInfoRow('Cashier', order.userName, fontSizeBase),
-                      const Divider(height: 16),
-
-                      // ----- Items (Scrollable if needed) -----
+                    ),
+                  ),
+                  const Center(
+                    child: Text(
+                      '123 Main Street, City',
+                      style: TextStyle(fontSize: smallFont),
+                    ),
+                  ),
+                  const Center(
+                    child: Text(
+                      'GSTIN: 12ABCDE1234F',
+                      style: TextStyle(fontSize: smallFont),
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  const _Dashed(),
+                  const SizedBox(height: 4),
+                  _row('Order #', order.orderNumber),
+                  _row(
+                    'Date',
+                    '${order.createdAt.day}/${order.createdAt.month}/${order.createdAt.year}',
+                  ),
+                  _row(
+                    'Time',
+                    '${order.createdAt.hour}:${order.createdAt.minute.toString().padLeft(2, '0')}',
+                  ),
+                  _row('Cashier', order.userName),
+                  const SizedBox(height: 4),
+                  const _Dashed(),
+                  const SizedBox(height: 4),
+                  Row(
+                    children: const [
                       Expanded(
-                        child: ListView.builder(
-                          itemCount: order.items.length,
-                          shrinkWrap: true,
-                          physics: const AlwaysScrollableScrollPhysics(),
-                          itemBuilder: (context, index) {
-                            final item = order.items[index];
-                            return Padding(
-                              padding: const EdgeInsets.symmetric(vertical: 4),
-                              child: Row(
-                                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                                children: [
-                                  Expanded(
-                                    child: Text(
-                                      '${item.product.name} x${item.quantity}',
-                                      style: TextStyle(fontSize: smallFont),
-                                    ),
-                                  ),
-                                  Text(
-                                    '$_currencyLabel${item.total.toStringAsFixed(2)}',
-                                    style: TextStyle(fontSize: smallFont),
-                                  ),
-                                ],
-                              ),
-                            );
-                          },
+                        flex: 5,
+                        child: Text(
+                          'Item',
+                          style: TextStyle(
+                            fontSize: smallFont,
+                            fontWeight: FontWeight.bold,
+                          ),
                         ),
                       ),
-
-                      // ----- Totals -----
-                      Column(
-                        children: [
-                          const Divider(height: 16),
-                          _buildTotalRow('Subtotal', order.subtotal, fontSizeBase),
-                          const SizedBox(height: 2),
-                          _buildTotalRow('Tax (18%)', order.tax, fontSizeBase),
-                          const Divider(),
-                          _buildTotalRow(
-                            'TOTAL',
-                            order.total,
-                            fontSizeBase,
-                            isBold: true,
-                            isLarge: true,
+                      Expanded(
+                        flex: 1,
+                        child: Text(
+                          'Qty',
+                          textAlign: TextAlign.right,
+                          style: TextStyle(
+                            fontSize: smallFont,
+                            fontWeight: FontWeight.bold,
                           ),
-                          const SizedBox(height: 12),
-
-                          // ----- Payment Method & Change -----
-                          Row(
-                            children: [
-                              Text(
-                                'Paid via: ',
-                                style: TextStyle(fontSize: smallFont),
-                              ),
-                              Chip(
-                                label: Text(
-                                  order.paymentMethod.toUpperCase(),
-                                  style: TextStyle(fontSize: smallFont - 1),
-                                ),
-                                backgroundColor: AppTheme.primaryOrange.withOpacity(0.1),
-                                visualDensity: VisualDensity.compact,
-                              ),
-                            ],
+                        ),
+                      ),
+                      Expanded(
+                        flex: 2,
+                        child: Text(
+                          'Amt',
+                          textAlign: TextAlign.right,
+                          style: TextStyle(
+                            fontSize: smallFont,
+                            fontWeight: FontWeight.bold,
                           ),
-                          if (order.paymentMethod == AppConstants.paymentCash && change > 0) ...[
-                            const SizedBox(height: 6),
-                            Row(
-                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                              children: [
-                                Text(
-                                  'Change',
-                                  style: TextStyle(fontSize: smallFont),
-                                ),
-                                Text(
-                                  '$_currencyLabel${change.toStringAsFixed(2)}',
-                                  style: TextStyle(
-                                    fontWeight: FontWeight.bold,
-                                    color: Colors.green,
-                                    fontSize: fontSizeBase,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ],
-                          const SizedBox(height: 16),
-
-                          // ----- Thank You -----
-                          Center(
-                            child: Text(
-                              'Thank you for shopping with us!',
-                              style: TextStyle(
-                                fontStyle: FontStyle.italic,
-                                color: Colors.grey,
-                                fontSize: smallFont,
-                              ),
-                            ),
-                          ),
-                          const SizedBox(height: 16),
-
-                          // ----- Action Buttons -----
-                          Row(
-                            children: [
-                              Expanded(
-                                child: OutlinedButton.icon(
-                                  onPressed: () {
-                                    Provider.of<NavigationProvider>(context, listen: false)
-                                        .setIndex(1);
-                                    Navigator.of(context).popUntil((route) => route.isFirst);
-                                  },
-                                  icon: const Icon(Icons.add_shopping_cart),
-                                  label: Text(
-                                    'New Receipt',
-                                    style: TextStyle(fontSize: fontSizeBase),
-                                  ),
-                                  style: OutlinedButton.styleFrom(
-                                    padding: const EdgeInsets.symmetric(vertical: 10),
-                                  ),
-                                ),
-                              ),
-                              const SizedBox(width: 12),
-                              Expanded(
-                                child: ElevatedButton.icon(
-                                  onPressed: () => _goToDashboard(context),
-                                  icon: const Icon(Icons.home),
-                                  label: Text(
-                                    'Dashboard',
-                                    style: TextStyle(fontSize: fontSizeBase),
-                                  ),
-                                  style: ElevatedButton.styleFrom(
-                                    padding: const EdgeInsets.symmetric(vertical: 10),
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ),
-                          const SizedBox(height: 8),
-                        ],
+                        ),
                       ),
                     ],
                   ),
-                ),
+                  const SizedBox(height: 2),
+                  ...order.items.map(
+                    (item) => Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 1),
+                      child: Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Expanded(
+                            flex: 5,
+                            child: Text(
+                              item.product.name,
+                              style: const TextStyle(fontSize: smallFont),
+                            ),
+                          ),
+                          Expanded(
+                            flex: 1,
+                            child: Text(
+                              '${item.quantity}',
+                              textAlign: TextAlign.right,
+                              style: const TextStyle(fontSize: smallFont),
+                            ),
+                          ),
+                          Expanded(
+                            flex: 2,
+                            child: Text(
+                              '$_currencyLabel${item.total.toStringAsFixed(2)}',
+                              textAlign: TextAlign.right,
+                              style: const TextStyle(fontSize: smallFont),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  const _Dashed(),
+                  const SizedBox(height: 4),
+                  _amountRow('Subtotal', order.subtotal),
+                  _amountRow('Tax (18%)', order.tax),
+                  const _Dashed(),
+                  const SizedBox(height: 2),
+                  _amountRow('TOTAL', order.total, isBold: true, isLarge: true),
+                  const SizedBox(height: 4),
+                  _row('Paid via', order.paymentMethod.toUpperCase()),
+                  if (order.paymentMethod == AppConstants.paymentCash &&
+                      change > 0)
+                    _amountRow('Change', change, isBold: true),
+                  const SizedBox(height: 6),
+                  const _Dashed(),
+                  const SizedBox(height: 4),
+                  const Center(
+                    child: Text(
+                      'Thank you for shopping with us!',
+                      style: TextStyle(
+                        fontSize: smallFont,
+                        fontStyle: FontStyle.italic,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: OutlinedButton(
+                          onPressed: () {
+                            Provider.of<NavigationProvider>(context,
+                                    listen: false)
+                                .setIndex(1);
+                            Navigator.of(context)
+                                .popUntil((route) => route.isFirst);
+                          },
+                          style: OutlinedButton.styleFrom(
+                            padding: const EdgeInsets.symmetric(vertical: 6),
+                            visualDensity: VisualDensity.compact,
+                          ),
+                          child: const Text(
+                            'New',
+                            style: TextStyle(fontSize: baseFont),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: ElevatedButton(
+                          onPressed: () => _goToDashboard(context),
+                          style: ElevatedButton.styleFrom(
+                            padding: const EdgeInsets.symmetric(vertical: 6),
+                            visualDensity: VisualDensity.compact,
+                          ),
+                          child: const Text(
+                            'Home',
+                            style: TextStyle(fontSize: baseFont),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
               ),
-            );
-          },
+            ),
+          ),
         ),
       ),
     );
   }
 
-  Widget _buildInfoRow(String label, String value, double fontSize) {
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-      children: [
-        Text(label, style: TextStyle(fontSize: fontSize - 1, color: Colors.grey[700])),
-        Text(
-          value,
-          style: TextStyle(fontWeight: FontWeight.w500, fontSize: fontSize - 1),
-        ),
-      ],
+  Widget _row(String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 1),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Text(label, style: const TextStyle(fontSize: 8)),
+          Text(
+            value,
+            style: const TextStyle(
+              fontSize: 8,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+        ],
+      ),
     );
   }
 
-  Widget _buildTotalRow(String label, double amount, double fontSize,
+  Widget _amountRow(String label, double amount,
       {bool isBold = false, bool isLarge = false}) {
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-      children: [
-        Text(
-          label,
-          style: TextStyle(
-            fontWeight: isBold ? FontWeight.bold : FontWeight.normal,
-            fontSize: isLarge ? fontSize + 2 : fontSize,
+    final size = isLarge ? 11.0 : 9.0;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 1),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Text(
+            label,
+            style: TextStyle(
+              fontSize: size,
+              fontWeight: isBold ? FontWeight.bold : FontWeight.normal,
+            ),
           ),
-        ),
-        Text(
-          '$_currencyLabel${amount.toStringAsFixed(2)}',
-          style: TextStyle(
-            fontWeight: isBold ? FontWeight.bold : FontWeight.normal,
-            fontSize: isLarge ? fontSize + 2 : fontSize,
-            color: isLarge ? AppTheme.primaryOrange : null,
+          Text(
+            '$_currencyLabel${amount.toStringAsFixed(2)}',
+            style: TextStyle(
+              fontSize: size,
+              fontWeight: isBold ? FontWeight.bold : FontWeight.normal,
+              color: isLarge ? AppTheme.primaryOrange : null,
+            ),
           ),
-        ),
-      ],
+        ],
+      ),
+    );
+  }
+}
+
+class _Dashed extends StatelessWidget {
+  const _Dashed();
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        const dashWidth = 3.0;
+        const dashSpace = 2.0;
+        final dashCount =
+            (constraints.maxWidth / (dashWidth + dashSpace)).floor();
+        return Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: List.generate(
+            dashCount,
+            (_) => const SizedBox(
+              width: dashWidth,
+              height: 1,
+              child: DecoratedBox(
+                decoration: BoxDecoration(color: Colors.black54),
+              ),
+            ),
+          ),
+        );
+      },
     );
   }
 }

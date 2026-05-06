@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_contacts/contact.dart' as flutter_contacts;
@@ -7,7 +8,6 @@ import 'package:focus_swiftbill/services/database_service.dart';
 import 'package:focus_swiftbill/providers/navigation_provider.dart';
 import 'package:focus_swiftbill/services/auth_service.dart';
 import 'package:focus_swiftbill/services/api_service.dart';
-import 'package:focus_swiftbill/services/product_sync_service.dart';
 import 'package:focus_swiftbill/services/session_service.dart';
 import 'package:focus_swiftbill/services/scanner_service.dart';
 import 'package:focus_swiftbill/models/product.dart';
@@ -23,7 +23,7 @@ import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:focus_swiftbill/screens/camera_scanner/camera_scanner_screen.dart';
 import 'package:focus_swiftbill/models/order.dart';
 import 'package:intl/intl.dart';
-import 'package:flutter_contacts/flutter_contacts.dart'; // Updated contacts package
+import 'package:flutter_contacts/flutter_contacts.dart';
 import 'package:focus_swiftbill/providers/orders_provider.dart';
 
 class BillingScreen extends StatefulWidget {
@@ -40,7 +40,13 @@ class _BillingScreenState extends State<BillingScreen> {
   final Uuid _uuid = const Uuid();
   final TextEditingController _memberNameController = TextEditingController();
   final TextEditingController _memberPhoneController = TextEditingController();
-  final ScrollController _productsScrollController = ScrollController();
+
+  // Dio instance for API calls
+  final Dio _apiDio = Dio(BaseOptions(
+    connectTimeout: const Duration(seconds: 15),
+    receiveTimeout: const Duration(seconds: 15),
+    headers: {'Accept': 'application/json'},
+  ));
 
   List<Product> _products = [];
   List<Product> _filteredProducts = [];
@@ -63,27 +69,30 @@ class _BillingScreenState extends State<BillingScreen> {
   // Customer selection state
   List<Map<String, String>> _members = [];
   Map<String, String>? _selectedMember;
-  // Removed unused _customerSearchController
 
   bool _isProcessing = false;
   bool _isLoadingProducts = true;
-  bool _isRefreshingProducts = false;
-  int _visibleProductCount = ProductSyncService.pageSize;
-  static const int _stockInfoBatchSize = 100;
-  Timer? _productSyncTimer;
-  final Map<String, ProductStockInfo> _productStockInfoById = {};
-  final Set<String> _loadingProductStockIds = <String>{};
 
   // Dedicated cart box for Sales Orders screen
   late Box<CartItem> _salesCartBox;
-  bool _isSalesCartBoxReady = false;   // <-- flag for safe clearing
+  bool _isSalesCartBoxReady = false;
+
+  // Pagination + lazy pricing
+  static const int _productsPageSize = 20;
+  int _visibleProductCount = _productsPageSize;
+  final ScrollController _productsScrollController = ScrollController();
+
+  // Helper constants
+  static const String _companyIdKey = 'selected_company_id';
+  static const int _priceDetailsBatchSize = 12;
+  final Set<String> _loadingProductPriceIds = <String>{};
 
   @override
   void initState() {
     super.initState();
     _initSalesCartBox();
     _productsScrollController.addListener(_onProductsScroll);
-    _initializeProducts();
+    _loadProducts();
     _loadCart();
     _searchController.addListener(_filterProducts);
     _session.resetTimer();
@@ -91,14 +100,31 @@ class _BillingScreenState extends State<BillingScreen> {
     _loadMembers().then((_) => _ensureMockMembers());
   }
 
+  void _onProductsScroll() {
+    if (!_productsScrollController.hasClients) return;
+    if (_visibleProductCount >= _filteredProducts.length) return;
+    final pos = _productsScrollController.position;
+    if (pos.pixels >= pos.maxScrollExtent - 200) {
+      _loadMoreProducts();
+    }
+  }
+
+  void _loadMoreProducts() {
+    if (_visibleProductCount >= _filteredProducts.length) return;
+    setState(() {
+      _visibleProductCount = (_visibleProductCount + _productsPageSize)
+          .clamp(0, _filteredProducts.length);
+    });
+    unawaited(_fetchVisibleProductPricing(_filteredProducts));
+  }
+
   Future<void> _initSalesCartBox() async {
-    // Use a separate box for sales orders (isolated from billing screen)
     _salesCartBox = await DatabaseService.getCartBox('sales_cart');
-    _isSalesCartBoxReady = true;       // <-- mark as ready
+    _isSalesCartBoxReady = true;
   }
 
   Future<void> _initScannerService() async {
-    _scannerService = ScannerService(); // local instance
+    _scannerService = ScannerService();
     final prefs = await SharedPreferences.getInstance();
     setState(() {
       _activeScanner = prefs.getString('last_scanner');
@@ -112,7 +138,6 @@ class _BillingScreenState extends State<BillingScreen> {
 
   @override
   void dispose() {
-    // ✅ Clear the dedicated sales cart when leaving the screen
     if (_isSalesCartBoxReady) {
       try {
         _salesCartBox.clear();
@@ -120,17 +145,12 @@ class _BillingScreenState extends State<BillingScreen> {
         debugPrint('Error clearing sales cart: $e');
       }
     }
-
-    // Clear in‑memory cart as well (optional, but clean)
     _cart.clear();
     _cartMap.clear();
-
     _barcodeSubscription?.cancel();
     _searchController.dispose();
     _memberNameController.dispose();
     _memberPhoneController.dispose();
-    // _customerSearchController.dispose() removed
-    _productSyncTimer?.cancel();
     _productsScrollController
       ..removeListener(_onProductsScroll)
       ..dispose();
@@ -138,54 +158,237 @@ class _BillingScreenState extends State<BillingScreen> {
     super.dispose();
   }
 
-  Future<void> _initializeProducts() async {
-    await _loadProducts(syncWithApi: true);
-    _startProductSyncSchedule();
-  }
+  // ==================== API HELPERS (same as billing_screen) ====================
 
-  void _startProductSyncSchedule() {
-    _productSyncTimer?.cancel();
-    _productSyncTimer = Timer.periodic(const Duration(minutes: 15), (_) {
-      _syncProductsIfDue();
-    });
-  }
-
-  Future<void> _syncProductsIfDue() async {
-    try {
-      final result = await ProductSyncService().ensureProductsLoaded(
-        source: ProductCatalogSource.sellerPriceBook,
-      );
-      if (result.usedRemoteData && mounted) {
-        await _loadProducts();
-      }
-    } catch (_) {
-      // Preserve cached products if background sync fails.
+  String _trimTrailingSlash(String value) {
+    final normalized = value.trim();
+    if (normalized.endsWith('/')) {
+      return normalized.substring(0, normalized.length - 1);
     }
+    return normalized;
   }
 
-  void _onProductsScroll() {
-    if (!_productsScrollController.hasClients || !_hasMoreProducts) {
+  String _billingApiRootFromBaseUrl(String baseUrl) {
+    final normalizedBaseUrl = _trimTrailingSlash(baseUrl);
+    final lower = normalizedBaseUrl.toLowerCase();
+    const marker = '/focus8api';
+    final markerIndex = lower.indexOf(marker);
+    final hostRoot = markerIndex >= 0
+        ? normalizedBaseUrl.substring(0, markerIndex)
+        : normalizedBaseUrl;
+    return '$hostRoot/pillayrpos/api/products';
+  }
+
+  Future<String> _getSelectedCompanyId() async {
+    final prefs = await SharedPreferences.getInstance();
+    final companyId = prefs.getString(_companyIdKey)?.trim() ?? '';
+    if (companyId.isEmpty) {
+      throw Exception('No company selected');
+    }
+    return companyId;
+  }
+
+  Future<String> _getBillingApiRoot() async {
+    final savedBaseUrl = await ApiService().getSavedBaseUrl();
+    final normalizedBaseUrl = _trimTrailingSlash(savedBaseUrl);
+    if (normalizedBaseUrl.isEmpty) {
+      throw Exception('Missing base URL');
+    }
+    return _billingApiRootFromBaseUrl(normalizedBaseUrl);
+  }
+
+  List<Map<String, dynamic>> _extractBillingRows(dynamic responseData) {
+    if (responseData is Map) {
+      final rows = responseData['datalist'];
+      if (rows is List) {
+        return rows.whereType<Map>().map((row) => Map<String, dynamic>.from(row)).toList();
+      }
+    }
+    return const [];
+  }
+
+  int _parseIntValue(dynamic value) {
+    if (value is int) return value;
+    if (value is num) return value.toInt();
+    return int.tryParse(value?.toString() ?? '') ?? 0;
+  }
+
+  double _parseDoubleValue(dynamic value) {
+    if (value is num) return value.toDouble();
+    return double.tryParse(value?.toString() ?? '') ?? 0;
+  }
+
+  Future<List<Product>> _fetchProductsFromApi() async {
+    final companyId = await _getSelectedCompanyId();
+    final apiRoot = await _getBillingApiRoot();
+    final response = await _apiDio.get(
+      '$apiRoot/productmaster',
+      queryParameters: {'compid': companyId},
+    );
+
+    final rows = _extractBillingRows(response.data);
+    return rows
+        .map(_mapBillingProductRow)
+        .where((p) => p.id.trim().isNotEmpty && p.name.trim().isNotEmpty)
+        .toList()
+      ..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+  }
+
+  Product _mapBillingProductRow(Map<String, dynamic> row) {
+    final rawQty = _parseIntValue(row['Qty']);
+    final stockAvailability =
+        row['StockAvailability']?.toString().trim().toLowerCase() == 'yes';
+    final normalizedQty = rawQty > 0 ? rawQty : (stockAvailability ? 1 : 0);
+    final barcode = row['barcode']?.toString().trim() ?? '';
+    final itemCode = row['itemcode']?.toString().trim() ?? '';
+
+    return Product(
+      id: row['Id']?.toString() ?? '',
+      name: row['product']?.toString().trim() ?? '',
+      barcode: barcode.isNotEmpty ? barcode : itemCode,
+      price: 0,
+      costPrice: 0,
+      stockQty: normalizedQty,
+      category: 'General',
+      isActive: true,
+      taxRate: 0,
+      currencyCode: '',
+    );
+  }
+
+  Future<_BillingPriceDetails?> _fetchProductPriceDetails({
+    required String apiRoot,
+    required String companyId,
+    required String itemId,
+  }) async {
+    final response = await _apiDio.get(
+      '$apiRoot/sellingmaster',
+      queryParameters: {
+        'compid': companyId,
+        'itemid': itemId,
+      },
+    );
+    final rows = _extractBillingRows(response.data);
+    if (rows.isEmpty) return null;
+    final row = rows.first;
+    return _BillingPriceDetails(
+      price: _parseDoubleValue(row['SellingPrice']),
+      taxRate: _parseDoubleValue(row['tax']),
+      currencyCode: row['currency']?.toString().trim() ?? '',
+    );
+  }
+
+  Future<void> _fetchVisibleProductPricing(List<Product> products) async {
+    if (products.isEmpty || _visibleProductCount == 0) return;
+
+    final visible =
+        products.take(_visibleProductCount.clamp(0, products.length)).toList();
+    final productsToLoad = visible.where((p) {
+      if (p.id.trim().isEmpty) return false;
+      if (_loadingProductPriceIds.contains(p.id)) return false;
+      // Skip if already loaded
+      return p.price <= 0 && p.currencyCode.trim().isEmpty && p.taxRate <= 0;
+    }).toList();
+
+    if (productsToLoad.isEmpty) return;
+
+    String companyId;
+    String apiRoot;
+    try {
+      companyId = await _getSelectedCompanyId();
+      apiRoot = await _getBillingApiRoot();
+    } catch (e) {
+      debugPrint('Pricing prerequisites missing: $e');
       return;
     }
 
-    final position = _productsScrollController.position;
-    if (position.pixels >= position.maxScrollExtent - 200) {
-      _loadMoreProducts();
+    _loadingProductPriceIds.addAll(productsToLoad.map((p) => p.id));
+    try {
+      for (var i = 0; i < productsToLoad.length; i += _priceDetailsBatchSize) {
+        final batch =
+            productsToLoad.skip(i).take(_priceDetailsBatchSize).toList();
+        final results = await Future.wait(batch.map((product) async {
+          try {
+            final details = await _fetchProductPriceDetails(
+              apiRoot: apiRoot,
+              companyId: companyId,
+              itemId: product.id,
+            );
+            return MapEntry(product.id, details);
+          } catch (e) {
+            debugPrint('Error loading price for ${product.id}: $e');
+            return MapEntry<String, _BillingPriceDetails?>(product.id, null);
+          }
+        }));
+
+        if (!mounted) return;
+        setState(() {
+          for (final entry in results) {
+            if (entry.value == null) continue;
+            for (final p in _products) {
+              if (p.id == entry.key) {
+                p.price = entry.value!.price;
+                p.taxRate = entry.value!.taxRate;
+                p.currencyCode = entry.value!.currencyCode;
+                break;
+              }
+            }
+          }
+        });
+      }
+    } finally {
+      _loadingProductPriceIds.removeAll(productsToLoad.map((p) => p.id));
     }
   }
 
-  void _loadMoreProducts() {
-    if (!_hasMoreProducts) return;
-    setState(() {
-      _visibleProductCount = (_visibleProductCount + ProductSyncService.pageSize)
-          .clamp(0, _filteredProducts.length);
-    });
-    _fetchProductStockInfo(_filteredProducts);
+  // ==================== PRODUCT LOADING (replaced) ====================
+
+  int _availableStockQty(Product product) => product.stockQty;
+
+  int _compareProductsByAvailability(Product a, Product b) {
+    final aInStock = _availableStockQty(a) > 0;
+    final bInStock = _availableStockQty(b) > 0;
+    if (aInStock != bInStock) {
+      return aInStock ? -1 : 1;
+    }
+    return a.name.toLowerCase().compareTo(b.name.toLowerCase());
+  }
+
+  Future<void> _loadProducts() async {
+    setState(() => _isLoadingProducts = true);
+    try {
+      final apiProducts = await _fetchProductsFromApi();
+      apiProducts.sort(_compareProductsByAvailability);
+
+      if (!mounted) return;
+      setState(() {
+        _products = apiProducts;
+        _filteredProducts = apiProducts;
+        _categories = ['All'];
+        _visibleProductCount = apiProducts.length < _productsPageSize
+            ? apiProducts.length
+            : _productsPageSize;
+        _isLoadingProducts = false;
+      });
+
+      // Lazy-load pricing only for the first visible page; the rest loads on scroll.
+      unawaited(_fetchVisibleProductPricing(apiProducts));
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Failed to load products: ${e.toString()}'),
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+      }
+      if (mounted) setState(() => _isLoadingProducts = false);
+    }
   }
 
   void _filterProducts() {
     final query = _searchController.text.toLowerCase();
-    final filteredProducts = _products.where((p) {
+    final filtered = _products.where((p) {
       final matchesSearch = p.name.toLowerCase().contains(query) ||
           p.barcode.toLowerCase().contains(query);
       final matchesCategory =
@@ -195,76 +398,14 @@ class _BillingScreenState extends State<BillingScreen> {
       ..sort(_compareProductsByAvailability);
 
     setState(() {
-      _filteredProducts = filteredProducts;
-      _visibleProductCount = filteredProducts.isEmpty
+      _filteredProducts = filtered;
+      _visibleProductCount = filtered.isEmpty
           ? 0
-          : filteredProducts.length < ProductSyncService.pageSize
-              ? filteredProducts.length
-              : ProductSyncService.pageSize;
+          : (filtered.length < _productsPageSize
+              ? filtered.length
+              : _productsPageSize);
     });
-    _fetchProductStockInfo(filteredProducts);
-  }
-
-  Future<void> _fetchProductStockInfo(
-    List<Product> products, {
-    bool forceRefresh = false,
-  }) async {
-    final idsToLoad = <String>[];
-    for (final product in products) {
-      final productId = product.id.trim();
-      if (productId.isEmpty || _loadingProductStockIds.contains(productId)) {
-        continue;
-      }
-      if (!forceRefresh && _productStockInfoById.containsKey(productId)) {
-        continue;
-      }
-      idsToLoad.add(productId);
-    }
-
-    if (idsToLoad.isEmpty) {
-      return;
-    }
-
-    if (forceRefresh) {
-      for (final productId in idsToLoad) {
-        _productStockInfoById.remove(productId);
-      }
-    }
-
-    _loadingProductStockIds.addAll(idsToLoad);
-    try {
-      final stockInfo = <String, ProductStockInfo>{};
-      for (var index = 0; index < idsToLoad.length; index += _stockInfoBatchSize) {
-        final batch = idsToLoad
-            .skip(index)
-            .take(_stockInfoBatchSize)
-            .toList();
-        final batchStockInfo = await ApiService().getStockInformationByProductIds(
-          batch,
-        );
-        stockInfo.addAll(batchStockInfo);
-      }
-      if (!mounted) return;
-      setState(() {
-        _productStockInfoById.addAll(stockInfo);
-        for (final product in _products) {
-          final liveInfo = stockInfo[product.id];
-          if (liveInfo == null) continue;
-          product.stockQty = liveInfo.availableStockQty;
-        }
-        for (final item in _cart) {
-          final liveInfo = stockInfo[item.product.id];
-          if (liveInfo == null) continue;
-          item.product.stockQty = liveInfo.availableStockQty;
-        }
-        _sortProductsByAvailability();
-        _updateTotals();
-      });
-    } catch (error) {
-      debugPrint('Unable to load stock information: $error');
-    } finally {
-      _loadingProductStockIds.removeAll(idsToLoad);
-    }
+    unawaited(_fetchVisibleProductPricing(filtered));
   }
 
   void _selectCategory(String category) {
@@ -274,92 +415,9 @@ class _BillingScreenState extends State<BillingScreen> {
     });
   }
 
-  Future<void> _loadProducts({bool syncWithApi = false, bool forceRefresh = false}) async {
-    if (mounted) {
-      setState(() {
-        if (_products.isEmpty || forceRefresh) {
-          _isLoadingProducts = true;
-        }
-      });
-    }
-
-    if (syncWithApi || forceRefresh) {
-      try {
-        final result = await ProductSyncService().ensureProductsLoaded(
-          forceRefresh: forceRefresh,
-          source: ProductCatalogSource.sellerPriceBook,
-        );
-        if (forceRefresh && mounted) {
-          final message = result.usedRemoteData
-              ? 'Products refreshed successfully'
-              : 'Products are already up to date';
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text('$message (${result.productCount} items available)'),
-              behavior: SnackBarBehavior.floating,
-            ),
-          );
-        }
-      } on ApiException catch (e) {
-        if (forceRefresh && mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text(e.message),
-              behavior: SnackBarBehavior.floating,
-              backgroundColor: Colors.redAccent,
-            ),
-          );
-        }
-      } catch (_) {
-        if (forceRefresh && mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text('Unable to refresh products right now'),
-              behavior: SnackBarBehavior.floating,
-              backgroundColor: Colors.redAccent,
-            ),
-          );
-        }
-      }
-    }
-
-    final box = DatabaseService.getProducts();
-    final categories = box.values
-        .where((p) => p.isActive)
-        .map((p) => p.category)
-        .where((c) => c.isNotEmpty)
-        .toSet()
-        .toList()
-      ..sort();
-    categories.insert(0, 'All');
-    final products = box.values
-        .where((p) => p.isActive)
-        .toList()
-      ..sort(_compareProductsByAvailability);
-
-    if (!mounted) return;
-    setState(() {
-      _products = products;
-      _categories = categories;
-      _isLoadingProducts = false;
-      if (forceRefresh) {
-        _productStockInfoById.clear();
-      }
-    });
-    _filterProducts();
-  }
-
-  Future<void> _refreshProducts() async {
-    if (_isRefreshingProducts) return;
-    setState(() => _isRefreshingProducts = true);
-    await _loadProducts(syncWithApi: true, forceRefresh: true);
-    if (mounted) {
-      setState(() => _isRefreshingProducts = false);
-    }
-  }
+  // ==================== CART METHODS (unchanged except totals) ====================
 
   Future<void> _loadCart() async {
-    // Ensure _salesCartBox is initialized
     await _initSalesCartBox();
     setState(() {
       _cart = _salesCartBox.values.toList();
@@ -378,82 +436,47 @@ class _BillingScreenState extends State<BillingScreen> {
   void _updateTotals() {
     _cartItemCount = _cart.fold(0, (sum, item) => sum + item.quantity);
     _cartSubtotal = _cart.fold(0, (sum, item) => sum + item.total);
-    _cartTaxTotal = _cart.fold(0, (sum, item) => sum + _itemTaxAmount(item));
+    _cartTaxTotal = _cart.fold(0, (sum, item) => sum + (item.total * item.product.taxRate / 100));
     _cartGrandTotal = _cartSubtotal + _cartTaxTotal;
     _cartVersion.value++;
   }
 
-  int _availableStockQty(Product product) {
-    return _productStockInfoById[product.id]?.availableStockQty ??
-        product.stockQty;
-  }
-
-  double _effectiveUnitPrice(Product product) {
-    return product.price;
-  }
-
-  double _productTaxRate(Product product) {
-    return product.taxRate < 0 ? 0 : product.taxRate;
-  }
-
-  double _itemTaxAmount(CartItem item) {
-    return item.total * (_productTaxRate(item.product) / 100);
-  }
-
-  String _formatPercentage(double value) {
-    return value % 1 == 0 ? value.toStringAsFixed(0) : value.toStringAsFixed(2);
-  }
-
-  int _compareProductsByAvailability(Product a, Product b) {
-    final aInStock = _availableStockQty(a) > 0;
-    final bInStock = _availableStockQty(b) > 0;
-    if (aInStock != bInStock) {
-      return aInStock ? -1 : 1;
-    }
-    return a.name.toLowerCase().compareTo(b.name.toLowerCase());
-  }
-
-  void _sortProductsByAvailability() {
-    _products.sort(_compareProductsByAvailability);
-    _filteredProducts.sort(_compareProductsByAvailability);
-  }
-
-  String _formatProductMetric(num value) {
-    return value % 1 == 0 ? value.toStringAsFixed(0) : value.toStringAsFixed(2);
-  }
-
-  String get _currencyLabel {
-    for (final item in _cart) {
-      final code = item.product.currencyCode.trim();
-      if (code.isNotEmpty) {
-        return code;
+  // Helper to ensure price/tax are loaded before adding to cart
+  Future<void> _ensureProductPricingLoaded(Product product) async {
+    if (product.price > 0) return;
+    try {
+      final companyId = await _getSelectedCompanyId();
+      final apiRoot = await _getBillingApiRoot();
+      final details = await _fetchProductPriceDetails(
+        apiRoot: apiRoot,
+        companyId: companyId,
+        itemId: product.id,
+      );
+      if (details != null && mounted) {
+        setState(() {
+          product.price = details.price;
+          product.taxRate = details.taxRate;
+          product.currencyCode = details.currencyCode;
+        });
+        unawaited(DatabaseService.getProducts().put(product.id, product));
       }
+    } catch (e) {
+      debugPrint('Error loading price for ${product.id} on add: $e');
     }
-    for (final product in _products) {
-      final code = product.currencyCode.trim();
-      if (code.isNotEmpty) {
-        return code;
-      }
-    }
-    return AppConstants.currencySymbol;
   }
 
   Future<void> _addToCart(Product product) async {
+    await _ensureProductPricingLoaded(product);
     final existingIdx = _cart.indexWhere((c) => c.product.id == product.id);
-    final availableStock = _availableStockQty(product);
-    final unitPrice = _effectiveUnitPrice(product);
-    product
-      ..stockQty = availableStock
-      ..price = unitPrice;
     CartItem newItem;
 
     if (existingIdx >= 0) {
       final current = _cart[existingIdx];
-      if (current.quantity >= availableStock) {
+      if (current.quantity >= product.stockQty) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
-              content: Text('Only $availableStock in stock'),
+              content: Text('Only ${product.stockQty} in stock'),
               behavior: SnackBarBehavior.floating,
               duration: const Duration(milliseconds: 800),
             ),
@@ -469,7 +492,7 @@ class _BillingScreenState extends State<BillingScreen> {
       _cart[existingIdx] = newItem;
       _cartMap[product.id] = newItem;
     } else {
-      if (availableStock <= 0) {
+      if (product.stockQty <= 0) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(
@@ -583,7 +606,7 @@ class _BillingScreenState extends State<BillingScreen> {
     }
   }
 
-  // ---------- Customer / Member management ----------
+  // ---------- Customer / Member management (unchanged) ----------
   Future<void> _loadMembers() async {
     final prefs = await SharedPreferences.getInstance();
     final List<String>? rawList = prefs.getStringList('members');
@@ -708,211 +731,159 @@ class _BillingScreenState extends State<BillingScreen> {
     );
   }
 
-  // NEW METHOD: Add from Contacts dialog (using flutter_contacts)
   Future<void> _showAddFromContactsDialog() async {
-  // Check current permission status
-  PermissionStatus status = await Permission.contacts.status;
-
-  // If permanently denied, guide user to settings and stop
-  if (status.isPermanentlyDenied) {
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: const Text(
-              'Contacts permission is permanently denied. Please enable it in Settings.'),
-          action: SnackBarAction(
-            label: 'Settings',
-            onPressed: () => openAppSettings(),
-          ),
-          behavior: SnackBarBehavior.floating,
-          duration: const Duration(seconds: 4),
-        ),
-      );
-    }
-    return;
-  }
-
-  // Request permission (system dialog will appear if not yet asked or denied once)
-  if (!await FlutterContacts.requestPermission(readonly: true)) {
-    // If after request it's still denied (possibly user denied again)
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Permission to access contacts denied.'),
-          behavior: SnackBarBehavior.floating,
-        ),
-      );
-    }
-    return;
-  }
-
-  // Fetch contacts
-  List<flutter_contacts.Contact> contacts;
-  try {
-    contacts = await FlutterContacts.getContacts(
-      withProperties: true,
-      withPhoto: false,
-    );
-  } catch (e) {
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Could not load contacts: $e')),
-      );
-    }
-    return;
-  }
-
-  // Filter to those with a display name and at least one phone number
-  final validContacts = contacts.where((c) {
-    return c.displayName.isNotEmpty && c.phones.isNotEmpty;
-  }).toList();
-
-  if (validContacts.isEmpty) {
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('No contacts with phone numbers found.'),
-          behavior: SnackBarBehavior.floating,
-        ),
-      );
-    }
-    return;
-  }
-
-  // Local state for the dialog
-  final Set<flutter_contacts.Contact> selectedContacts = {};
-  String searchQuery = '';
-
-  // Show dialog
-  await showDialog<Set<flutter_contacts.Contact>>(
-    context: context,
-    builder: (ctx) {
-      return StatefulBuilder(
-        builder: (context, setDialogState) {
-          final filtered = searchQuery.isEmpty
-              ? validContacts
-              : validContacts
-                  .where((c) => c.displayName
-                      .toLowerCase()
-                      .contains(searchQuery.toLowerCase()))
-                  .toList();
-
-          return AlertDialog(
-            title: const Text('Select Contacts'),
-            content: SizedBox(
-              width: double.maxFinite,
-              height: 400,
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  TextField(
-                    onChanged: (val) {
-                      setDialogState(() {
-                        searchQuery = val;
-                      });
-                    },
-                    decoration: InputDecoration(
-                      hintText: 'Search contacts...',
-                      prefixIcon: const Icon(Icons.search, size: 18),
-                      filled: true,
-                      fillColor: Colors.grey.shade100,
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(10),
-                        borderSide: BorderSide.none,
-                      ),
-                      contentPadding: const EdgeInsets.symmetric(
-                          horizontal: 10, vertical: 8),
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                  Expanded(
-                    child: filtered.isEmpty
-                        ? const Center(child: Text('No contacts match'))
-                        : ListView.builder(
-                            shrinkWrap: true,
-                            itemCount: filtered.length,
-                            itemBuilder: (ctx, idx) {
-                              final contact = filtered[idx];
-                              final phone = contact.phones.first.number;
-                              final isSelected =
-                                  selectedContacts.contains(contact);
-
-                              return CheckboxListTile(
-                                title: Text(contact.displayName,
-                                    style: const TextStyle(fontSize: 14)),
-                                subtitle: Text(phone,
-                                    style: const TextStyle(fontSize: 12)),
-                                value: isSelected,
-                                onChanged: (bool? checked) {
-                                  setDialogState(() {
-                                    if (checked == true) {
-                                      selectedContacts.add(contact);
-                                    } else {
-                                      selectedContacts.remove(contact);
-                                    }
-                                  });
-                                },
-                                controlAffinity:
-                                    ListTileControlAffinity.leading,
-                              );
-                            },
-                          ),
-                  ),
-                ],
-              ),
-            ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(ctx),
-                child: const Text('Cancel'),
-              ),
-              ElevatedButton(
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: AppTheme.primaryOrange,
-                  foregroundColor: Colors.white,
-                ),
-                onPressed: () => Navigator.pop(ctx, selectedContacts),
-                child: const Text('Add Selected'),
-              ),
-            ],
-          );
-        },
-      );
-    },
-  ).then((result) async {
-    if (result != null && result.isNotEmpty) {
-      int added = 0;
-      for (final contact in result) {
-        final name = contact.displayName;
-        final phone = contact.phones.first.number;
-        if (phone.isEmpty) continue;
-
-        final exists = _members.any((m) => m['phone'] == phone);
-        if (!exists) {
-          await _saveMember(name, phone);
-          added++;
-        }
-      }
-
-      if (mounted && added > 0) {
+    PermissionStatus status = await Permission.contacts.status;
+    if (status.isPermanentlyDenied) {
+      if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Added $added customer(s) from contacts.'),
+            content: const Text('Contacts permission is permanently denied. Please enable it in Settings.'),
+            action: SnackBarAction(
+              label: 'Settings',
+              onPressed: () => openAppSettings(),
+            ),
             behavior: SnackBarBehavior.floating,
-          ),
-        );
-      } else if (mounted && added == 0) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text(
-                'No new customers added. All selected contacts are already members.'),
-            behavior: SnackBarBehavior.floating,
+            duration: const Duration(seconds: 4),
           ),
         );
       }
+      return;
     }
-  });
-}
+    if (!await FlutterContacts.requestPermission(readonly: true)) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Permission to access contacts denied.'), behavior: SnackBarBehavior.floating),
+        );
+      }
+      return;
+    }
+    List<flutter_contacts.Contact> contacts;
+    try {
+      contacts = await FlutterContacts.getContacts(withProperties: true, withPhoto: false);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Could not load contacts: $e')));
+      }
+      return;
+    }
+    final validContacts = contacts.where((c) => c.displayName.isNotEmpty && c.phones.isNotEmpty).toList();
+    if (validContacts.isEmpty) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('No contacts with phone numbers found.'), behavior: SnackBarBehavior.floating),
+        );
+      }
+      return;
+    }
+    final Set<flutter_contacts.Contact> selectedContacts = {};
+    String searchQuery = '';
+    await showDialog<Set<flutter_contacts.Contact>>(
+      context: context,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            final filtered = searchQuery.isEmpty
+                ? validContacts
+                : validContacts.where((c) => c.displayName.toLowerCase().contains(searchQuery.toLowerCase())).toList();
+            return AlertDialog(
+              title: const Text('Select Contacts'),
+              content: SizedBox(
+                width: double.maxFinite,
+                height: 400,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    TextField(
+                      onChanged: (val) {
+                        setDialogState(() {
+                          searchQuery = val;
+                        });
+                      },
+                      decoration: InputDecoration(
+                        hintText: 'Search contacts...',
+                        prefixIcon: const Icon(Icons.search, size: 18),
+                        filled: true,
+                        fillColor: Colors.grey.shade100,
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(10),
+                          borderSide: BorderSide.none,
+                        ),
+                        contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Expanded(
+                      child: filtered.isEmpty
+                          ? const Center(child: Text('No contacts match'))
+                          : ListView.builder(
+                              shrinkWrap: true,
+                              itemCount: filtered.length,
+                              itemBuilder: (ctx, idx) {
+                                final contact = filtered[idx];
+                                final phone = contact.phones.first.number;
+                                final isSelected = selectedContacts.contains(contact);
+                                return CheckboxListTile(
+                                  title: Text(contact.displayName, style: const TextStyle(fontSize: 14)),
+                                  subtitle: Text(phone, style: const TextStyle(fontSize: 12)),
+                                  value: isSelected,
+                                  onChanged: (bool? checked) {
+                                    setDialogState(() {
+                                      if (checked == true) {
+                                        selectedContacts.add(contact);
+                                      } else {
+                                        selectedContacts.remove(contact);
+                                      }
+                                    });
+                                  },
+                                  controlAffinity: ListTileControlAffinity.leading,
+                                );
+                              },
+                            ),
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+                ElevatedButton(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: AppTheme.primaryOrange,
+                    foregroundColor: Colors.white,
+                  ),
+                  onPressed: () => Navigator.pop(ctx, selectedContacts),
+                  child: const Text('Add Selected'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    ).then((result) async {
+      if (result != null && result.isNotEmpty) {
+        int added = 0;
+        for (final contact in result) {
+          final name = contact.displayName;
+          final phone = contact.phones.first.number;
+          if (phone.isEmpty) continue;
+          final exists = _members.any((m) => m['phone'] == phone);
+          if (!exists) {
+            await _saveMember(name, phone);
+            added++;
+          }
+        }
+        if (mounted && added > 0) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Added $added customer(s) from contacts.'), behavior: SnackBarBehavior.floating),
+          );
+        } else if (mounted && added == 0) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('No new customers added. All selected contacts are already members.'), behavior: SnackBarBehavior.floating),
+          );
+        }
+      }
+    });
+  }
+
   Future<void> _saveMember(String name, String phone) async {
     try {
       final prefs = await SharedPreferences.getInstance();
@@ -927,110 +898,107 @@ class _BillingScreenState extends State<BillingScreen> {
     }
   }
 
-  // ---------- Create order directly (no payment) ----------
-Future<void> _createOrder() async {
-  if (_selectedMember == null) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text('Please select a customer before placing order'),
-        behavior: SnackBarBehavior.floating,
-        duration: Duration(seconds: 2),
-      ),
-    );
-    return;
-  }
-
-  if (_cart.isEmpty) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Cart is empty'), behavior: SnackBarBehavior.floating),
-    );
-    return;
-  }
-
-  setState(() => _isProcessing = true);
-
-  try {
-    String orderNumber;
-    try {
-      orderNumber = await Order.generateOrderNumber().timeout(const Duration(seconds: 10));
-    } on TimeoutException {
-      final now = DateTime.now();
-      final dateKey = DateFormat('yyyyMMdd').format(now);
-      final timestamp = now.millisecondsSinceEpoch % 100000;
-      orderNumber = 'ORD-$dateKey-TIMEOUT-${timestamp.toString().padLeft(5, '0')}';
-    }
-
-    final userId = _auth.getUserId();
-    final userName = _auth.getUserName();
-    final userRole = _auth.getUserRole();
-    final customerName = _selectedMember!['name']!;
-
-    final subtotal = _cartSubtotal;
-    final tax = _cartTaxTotal;
-    final total = _cartGrandTotal;
-
-    final order = Order(
-      id: _uuid.v4(),
-      orderNumber: orderNumber,
-      userId: userId ?? 'unknown',
-      userName: userName ?? 'Unknown',
-      userRole: userRole ?? AppConstants.roleCashier,
-      items: List.from(_cart),
-      subtotal: subtotal,
-      tax: tax,
-      total: total,
-      paymentMethod: 'Pending',
-      status: AppConstants.statusCompleted,
-      createdAt: DateTime.now(),
-      synced: false,
-    );
-
-    final ordersBox = DatabaseService.getOrders();
-    await ordersBox.put(order.id, order);
-
-    final productsBox = DatabaseService.getProducts();
-    for (var item in _cart) {
-      final product = productsBox.get(item.product.id);
-      if (product != null) {
-        product.stockQty -= item.quantity;
-        if (product.stockQty < 0) product.stockQty = 0;
-        await productsBox.put(product.id, product);
-      }
-    }
-
-    // Clear the sales cart after order is placed
-    await _salesCartBox.clear();
-    _cart.clear();
-    _cartMap.clear();
-    _updateTotals();   // updates _cartVersion, _cartItemCount, and totals
-    if (mounted) setState(() {});   // refresh UI
-
-    if (mounted) {
+  // ---------- Create order (updated tax calculation) ----------
+  Future<void> _createOrder() async {
+    if (_selectedMember == null) {
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Order $orderNumber saved for $customerName'),
+        const SnackBar(
+          content: Text('Please select a customer before placing order'),
           behavior: SnackBarBehavior.floating,
-          duration: const Duration(seconds: 3),
+          duration: Duration(seconds: 2),
         ),
       );
-
-      // Notify OrdersScreen to refresh its list
-      Provider.of<OrdersProvider>(context, listen: false).refreshOrders();
-
-      // Switch to Orders tab (index 2) and return to main screen
-      Provider.of<NavigationProvider>(context, listen: false).setIndex(2);
-      Navigator.pop(context);
+      return;
     }
-  } catch (e) {
-    if (mounted) {
+    if (_cart.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Error: ${e.toString()}'), behavior: SnackBarBehavior.floating),
+        const SnackBar(content: Text('Cart is empty'), behavior: SnackBarBehavior.floating),
       );
+      return;
     }
-  } finally {
-    if (mounted) setState(() => _isProcessing = false);
+
+    setState(() => _isProcessing = true);
+
+    try {
+      String orderNumber;
+      try {
+        orderNumber = await Order.generateOrderNumber().timeout(const Duration(seconds: 10));
+      } on TimeoutException {
+        final now = DateTime.now();
+        final dateKey = DateFormat('yyyyMMdd').format(now);
+        final timestamp = now.millisecondsSinceEpoch % 100000;
+        orderNumber = 'ORD-$dateKey-TIMEOUT-${timestamp.toString().padLeft(5, '0')}';
+      }
+
+      final userId = _auth.getUserId();
+      final userName = _auth.getUserName();
+      final userRole = _auth.getUserRole();
+      final customerName = _selectedMember!['name']!;
+
+      final subtotal = _cartSubtotal;
+      final tax = _cartTaxTotal;
+      final total = subtotal + tax;
+
+      final order = Order(
+        id: _uuid.v4(),
+        orderNumber: orderNumber,
+        userId: userId ?? 'unknown',
+        userName: userName ?? 'Unknown',
+        userRole: userRole ?? AppConstants.roleCashier,
+        items: List.from(_cart),
+        subtotal: subtotal,
+        tax: tax,
+        total: total,
+        paymentMethod: 'Pending',
+        status: AppConstants.statusCompleted,
+        createdAt: DateTime.now(),
+        synced: false,
+      );
+
+      final ordersBox = DatabaseService.getOrders();
+      await ordersBox.put(order.id, order);
+
+      final productsBox = DatabaseService.getProducts();
+      for (var item in _cart) {
+        final product = productsBox.get(item.product.id);
+        if (product != null) {
+          product.stockQty -= item.quantity;
+          if (product.stockQty < 0) product.stockQty = 0;
+          await productsBox.put(product.id, product);
+        }
+      }
+
+      await _salesCartBox.clear();
+      _cart.clear();
+      _cartMap.clear();
+      _updateTotals();
+      if (mounted) setState(() {});
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Order $orderNumber saved for $customerName'),
+            behavior: SnackBarBehavior.floating,
+            duration: const Duration(seconds: 3),
+          ),
+        );
+        Provider.of<OrdersProvider>(context, listen: false).refreshOrders();
+        Provider.of<NavigationProvider>(context, listen: false).setIndex(2);
+        Navigator.pop(context);
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error: ${e.toString()}'), behavior: SnackBarBehavior.floating),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isProcessing = false);
+    }
   }
-}
+
+  // ==================== UI BUILDERS (unchanged except minor total display) ====================
+
   Color _getStockColor(int stockQty) {
     if (stockQty == 0) return Colors.grey;
     if (stockQty <= 3) return Colors.red;
@@ -1039,20 +1007,27 @@ Future<void> _createOrder() async {
     return Colors.green;
   }
 
-  bool get _hasMoreProducts => _visibleProductCount < _filteredProducts.length;
+  String _formatPercentage(double value) {
+    return value % 1 == 0 ? value.toStringAsFixed(0) : value.toStringAsFixed(2);
+  }
 
-  List<Product> get _visibleProducts => _filteredProducts
-      .take(_visibleProductCount.clamp(0, _filteredProducts.length))
-      .toList();
+  String get _currencyLabel {
+    for (final item in _cart) {
+      final code = item.product.currencyCode.trim();
+      if (code.isNotEmpty) return code;
+    }
+    for (final product in _products) {
+      final code = product.currencyCode.trim();
+      if (code.isNotEmpty) return code;
+    }
+    return AppConstants.currencySymbol;
+  }
 
   Widget _buildProductCard(Product product) {
-    final stockInfo = _productStockInfoById[product.id];
-    final availableStock = _availableStockQty(product);
-    final unitPrice = _effectiveUnitPrice(product);
-    final inStock = availableStock > 0;
+    final inStock = product.stockQty > 0;
     final cartQty = getCartQuantity(product);
-    final canAdd = inStock && cartQty < availableStock;
-    final taxLabel = _formatPercentage(_productTaxRate(product));
+    final canAdd = inStock && cartQty < product.stockQty;
+    final lineTotal = product.price * cartQty;
 
     return GestureDetector(
       onTap: () {
@@ -1082,7 +1057,7 @@ Future<void> _createOrder() async {
                     begin: Alignment.topLeft,
                     end: Alignment.bottomRight,
                     colors: inStock
-                        ? [_getStockColor(availableStock).withOpacity(0.1), _getStockColor(availableStock).withOpacity(0.04)]
+                        ? [_getStockColor(product.stockQty).withOpacity(0.1), _getStockColor(product.stockQty).withOpacity(0.04)]
                         : [Colors.grey.shade100, Colors.grey.shade50],
                   ),
                   borderRadius: const BorderRadius.vertical(top: Radius.circular(10)),
@@ -1090,7 +1065,7 @@ Future<void> _createOrder() async {
                 child: Stack(
                   children: [
                     Center(
-                      child: Icon(Icons.inventory_2, size: 30, color: _getStockColor(availableStock).withOpacity(0.35)),
+                      child: Icon(Icons.inventory_2, size: 30, color: _getStockColor(product.stockQty).withOpacity(0.35)),
                     ),
                     if (!inStock)
                       const Positioned.fill(
@@ -1101,7 +1076,7 @@ Future<void> _createOrder() async {
                           ),
                         ),
                       ),
-                    if (inStock && availableStock <= 5)
+                    if (inStock && product.stockQty <= 5)
                       Positioned(
                         top: 3,
                         right: 3,
@@ -1112,7 +1087,7 @@ Future<void> _createOrder() async {
                             borderRadius: BorderRadius.circular(5),
                             border: Border.all(color: Colors.orange.shade300, width: 0.5),
                           ),
-                          child: Text('L$availableStock', style: TextStyle(fontSize: 8, fontWeight: FontWeight.w600, color: Colors.orange.shade800)),
+                          child: Text('L${product.stockQty}', style: TextStyle(fontSize: 8, fontWeight: FontWeight.w600, color: Colors.orange.shade800)),
                         ),
                       ),
                   ],
@@ -1134,13 +1109,18 @@ Future<void> _createOrder() async {
                     ),
                     const SizedBox(height: 2),
                     Text(
-                      '$_currencyLabel${unitPrice.toStringAsFixed(2)}',
+                      '${_currencyLabel}${product.price.toStringAsFixed(2)}',
                       style: const TextStyle(color: AppTheme.primaryOrange, fontWeight: FontWeight.w700, fontSize: 12),
                     ),
                     const SizedBox(height: 2),
-                    
-                  
-                    
+                    Text(
+                      'Stock: ${product.stockQty}',
+                      style: TextStyle(
+                        color: inStock ? Colors.grey.shade700 : Colors.red.shade400,
+                        fontWeight: FontWeight.w500,
+                        fontSize: 10,
+                      ),
+                    ),
                     const Spacer(),
                     Row(
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
@@ -1220,202 +1200,219 @@ Future<void> _createOrder() async {
   }
 
   Widget _buildCartSheetBody(ScrollController scrollController) {
-  return Container(
-    decoration: const BoxDecoration(
-      color: Colors.white,
-      borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-    ),
-    child: Column(
-      children: [
-        Container(
-          margin: const EdgeInsets.symmetric(vertical: 10),
-          width: 36,
-          height: 4,
-          decoration: BoxDecoration(
-            color: Colors.grey.shade300,
-            borderRadius: BorderRadius.circular(2),
+    return Container(
+      decoration: const BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      child: Column(
+        children: [
+          Container(
+            margin: const EdgeInsets.symmetric(vertical: 10),
+            width: 36,
+            height: 4,
+            decoration: BoxDecoration(
+              color: Colors.grey.shade300,
+              borderRadius: BorderRadius.circular(2),
+            ),
           ),
-        ),
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Text('Cart ($_cartItemCount)',
-                  style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
-              IconButton(
-                icon: const Icon(Icons.close),
-                visualDensity: VisualDensity.compact,
-                onPressed: () => Navigator.pop(context),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text('Cart ($_cartItemCount)', style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+                IconButton(icon: const Icon(Icons.close), visualDensity: VisualDensity.compact, onPressed: () => Navigator.pop(context)),
+              ],
+            ),
+          ),
+          const Divider(height: 1),
+          Expanded(
+            child: _cart.isEmpty
+                ? const Center(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(Icons.shopping_cart_outlined, size: 48, color: Colors.grey),
+                        SizedBox(height: 12),
+                        Text('Cart is empty'),
+                      ],
+                    ),
+                  )
+                : ListView.builder(
+                    controller: scrollController,
+                    padding: const EdgeInsets.all(12),
+                    itemCount: _cart.length,
+                    itemBuilder: (context, index) {
+                      final item = _cart[index];
+                      final lineTotal = item.product.price * item.quantity;
+                      return Card(
+                        margin: const EdgeInsets.only(bottom: 8),
+                        elevation: 0,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(12),
+                          side: BorderSide(color: Colors.grey.shade200),
+                        ),
+                        child: Padding(
+                          padding: const EdgeInsets.fromLTRB(10, 10, 10, 10),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Row(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Container(
+                                    width: 36,
+                                    height: 36,
+                                    decoration: BoxDecoration(
+                                      color: AppTheme.primaryOrange.withOpacity(0.1),
+                                      borderRadius: BorderRadius.circular(8),
+                                    ),
+                                    child: Icon(Icons.inventory_2, size: 20, color: AppTheme.primaryOrange),
+                                  ),
+                                  const SizedBox(width: 10),
+                                  Expanded(
+                                    child: Column(
+                                      crossAxisAlignment: CrossAxisAlignment.start,
+                                      children: [
+                                        Text(
+                                          item.product.name,
+                                          style: const TextStyle(
+                                            fontWeight: FontWeight.w600,
+                                            fontSize: 13,
+                                            height: 1.25,
+                                          ),
+                                          softWrap: true,
+                                        ),
+                                        const SizedBox(height: 3),
+                                        Text(
+                                          '${_currencyLabel}${item.product.price.toStringAsFixed(2)} • Tax ${_formatPercentage(item.product.taxRate)}%',
+                                          style: TextStyle(fontSize: 11, color: Colors.grey.shade600),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 10),
+                              Row(
+                                children: [
+                                  Container(
+                                    decoration: BoxDecoration(
+                                      color: Colors.grey.shade100,
+                                      borderRadius: BorderRadius.circular(24),
+                                    ),
+                                    child: Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        InkWell(
+                                          onTap: () => _removeFromCart(item.product),
+                                          borderRadius: BorderRadius.circular(24),
+                                          child: const Padding(
+                                            padding: EdgeInsets.all(7),
+                                            child: Icon(Icons.remove, size: 16, color: Colors.red),
+                                          ),
+                                        ),
+                                        Container(
+                                          constraints: const BoxConstraints(minWidth: 30),
+                                          alignment: Alignment.center,
+                                          child: Text(
+                                            '${item.quantity}',
+                                            style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 13),
+                                          ),
+                                        ),
+                                        InkWell(
+                                          onTap: () => _addToCart(item.product),
+                                          borderRadius: BorderRadius.circular(24),
+                                          child: const Padding(
+                                            padding: EdgeInsets.all(7),
+                                            child: Icon(Icons.add, size: 16, color: AppTheme.primaryOrange),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                  const Spacer(),
+                                  Text(
+                                    '${_currencyLabel}${lineTotal.toStringAsFixed(2)}',
+                                    style: const TextStyle(
+                                      fontWeight: FontWeight.w700,
+                                      fontSize: 13,
+                                      color: AppTheme.primaryOrange,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ],
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+          ),
+          SafeArea(
+            child: Container(
+              padding: const EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                boxShadow: [BoxShadow(color: Colors.grey.shade200, blurRadius: 8, offset: const Offset(0, -2))],
               ),
-            ],
-          ),
-        ),
-        const Divider(height: 1),
-        Expanded(
-          child: _cart.isEmpty
-              ? const Center(
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
-                      Icon(Icons.shopping_cart_outlined,
-                          size: 48, color: Colors.grey),
-                      SizedBox(height: 12),
-                      Text('Cart is empty'),
+                      const Text('Subtotal', style: TextStyle(fontSize: 13)),
+                      Text('${_currencyLabel}${_cartSubtotal.toStringAsFixed(2)}', style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
                     ],
                   ),
-                )
-              : ListView.builder(
-                  controller: scrollController,
-                  padding: const EdgeInsets.all(12),
-                  itemCount: _cart.length,
-                  itemBuilder: (context, index) {
-                    final item = _cart[index];
-                    return Card(
-                      margin: const EdgeInsets.only(bottom: 8),
-                      elevation: 0,
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(10),
-                        side: BorderSide(color: Colors.grey.shade200),
-                      ),
-                      child: ListTile(
-                        dense: true,
-                        leading: Container(
-                          width: 36,
-                          height: 36,
-                          decoration: BoxDecoration(
-                            color: AppTheme.primaryOrange.withOpacity(0.1),
-                            borderRadius: BorderRadius.circular(8),
-                          ),
-                          child: Icon(Icons.inventory_2,
-                              size: 20, color: AppTheme.primaryOrange),
-                        ),
-                        title: Text(
-                          item.product.name,
-                          style: const TextStyle(
-                              fontWeight: FontWeight.w500, fontSize: 13),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                        subtitle: Text(
-                          '$_currencyLabel${item.product.price.toStringAsFixed(2)} • Tax ${_formatPercentage(_productTaxRate(item.product))}%',
-                          style: const TextStyle(fontSize: 11),
-                        ),
-                        trailing: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            IconButton(
-                              icon: const Icon(Icons.remove_circle_outline,
-                                  size: 18),
-                              onPressed: () => _removeFromCart(item.product),
-                              color: Colors.red,
-                            ),
-                            Text('${item.quantity}',
-                                style: const TextStyle(
-                                    fontWeight: FontWeight.w600, fontSize: 13)),
-                            IconButton(
-                              icon: const Icon(Icons.add_circle_outline,
-                                  size: 18),
-                              onPressed: () => _addToCart(item.product),
-                              color: AppTheme.primaryOrange,
-                            ),
-                          ],
-                        ),
-                      ),
-                    );
-                  },
-                ),
-        ),
-        // ✅ Wrap bottom container with SafeArea to avoid system navigation overlap
-        SafeArea(
-          child: Container(
-            padding: const EdgeInsets.all(16),
-            decoration: BoxDecoration(
-              color: Colors.white,
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.grey.shade200,
-                  blurRadius: 8,
-                  offset: const Offset(0, -2),
-                )
-              ],
-            ),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    const Text('Subtotal', style: TextStyle(fontSize: 13)),
-                    Text(
-                      '$_currencyLabel${_cartSubtotal.toStringAsFixed(2)}',
-                      style: const TextStyle(
-                          fontSize: 13, fontWeight: FontWeight.w600),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 4),
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    const Text('Tax',
-                        style: TextStyle(fontSize: 12, color: Colors.grey)),
-                    Text(
-                      '$_currencyLabel${_cartTaxTotal.toStringAsFixed(2)}',
-                      style: const TextStyle(fontSize: 12),
-                    ),
-                  ],
-                ),
-                const Divider(height: 12),
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    const Text('Total',
-                        style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
-                    Text(
-                      '$_currencyLabel${_cartGrandTotal.toStringAsFixed(2)}',
-                      style: const TextStyle(
-                          fontSize: 16,
-                          fontWeight: FontWeight.w700,
-                          color: AppTheme.primaryOrange),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 12),
-                SizedBox(
-                  width: double.infinity,
-                  child: ElevatedButton(
-                    onPressed: _cart.isNotEmpty && !_isProcessing
-                        ? () {
-                            Navigator.pop(context);
-                            _createOrder();
-                          }
-                        : null,
-                    style: ElevatedButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(vertical: 12),
-                      shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(12)),
-                    ),
-                    child: _isProcessing
-                        ? const SizedBox(
-                            height: 20,
-                            width: 20,
-                            child: CircularProgressIndicator(
-                              strokeWidth: 2,
-                              valueColor: AlwaysStoppedAnimation(Colors.white),
-                            ),
-                          )
-                        : const Text('Proceed Order', style: TextStyle(fontSize: 14)),
+                  const SizedBox(height: 4),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      const Text('Tax', style: TextStyle(fontSize: 12, color: Colors.grey)),
+                      Text('${_currencyLabel}${_cartTaxTotal.toStringAsFixed(2)}', style: const TextStyle(fontSize: 12)),
+                    ],
                   ),
-                ),
-              ],
+                  const Divider(height: 12),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      const Text('Total', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
+                      Text(
+                        '${_currencyLabel}${_cartGrandTotal.toStringAsFixed(2)}',
+                        style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: AppTheme.primaryOrange),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  SizedBox(
+                    width: double.infinity,
+                    child: ElevatedButton(
+                      onPressed: _cart.isNotEmpty && !_isProcessing
+                          ? () {
+                              Navigator.pop(context);
+                              _createOrder();
+                            }
+                          : null,
+                      style: ElevatedButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(vertical: 12),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                      ),
+                      child: _isProcessing
+                          ? const SizedBox(height: 20, width: 20, child: CircularProgressIndicator(strokeWidth: 2, valueColor: AlwaysStoppedAnimation(Colors.white)))
+                          : const Text('Proceed Order', style: TextStyle(fontSize: 14)),
+                    ),
+                  ),
+                ],
+              ),
             ),
           ),
-        ),
-      ],
-    ),
-  );
-}
+        ],
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1442,8 +1439,7 @@ Future<void> _createOrder() async {
                   children: [
                     Expanded(
                       child: Autocomplete<Map<String, String>>(
-                        displayStringForOption: (option) =>
-                          '${option['name'] ?? ''}  •  ${option['phone'] ?? ''}',
+                        displayStringForOption: (option) => '${option['name'] ?? ''}  •  ${option['phone'] ?? ''}',
                         optionsBuilder: (TextEditingValue textEditingValue) {
                           if (textEditingValue.text.isEmpty) return _members;
                           return _members.where((member) =>
@@ -1453,7 +1449,6 @@ Future<void> _createOrder() async {
                         onSelected: (Map<String, String> selection) {
                           setState(() {
                             _selectedMember = selection;
-                            // No need to manually set controller text; Autocomplete handles it
                           });
                         },
                         fieldViewBuilder: (context, textEditingController, focusNode, onFieldSubmitted) {
@@ -1462,9 +1457,9 @@ Future<void> _createOrder() async {
                             focusNode: focusNode,
                             onSubmitted: (value) => onFieldSubmitted(),
                             decoration: InputDecoration(
-                             hintText: _selectedMember != null
-                              ? '${_selectedMember!['name']}  •  ${_selectedMember!['phone']}'
-                              : 'Search or select customer',
+                              hintText: _selectedMember != null
+                                  ? '${_selectedMember!['name']}  •  ${_selectedMember!['phone']}'
+                                  : 'Search or select customer',
                               prefixIcon: Icon(
                                 _selectedMember != null ? Icons.person : Icons.person_outline,
                                 size: 18,
@@ -1474,9 +1469,7 @@ Future<void> _createOrder() async {
                                   ? IconButton(
                                       icon: const Icon(Icons.clear, size: 16),
                                       onPressed: () {
-                                        // Clear the Autocomplete's internal controller
                                         textEditingController.clear();
-                                        // Refocus to show the options list again
                                         focusNode.requestFocus();
                                         setState(() {
                                           _selectedMember = null;
@@ -1500,7 +1493,6 @@ Future<void> _createOrder() async {
                       tooltip: 'Add new customer',
                       onPressed: _showAddMemberDialog,
                     ),
-                    // NEW BUTTON: Add from Contacts
                     IconButton(
                       icon: Icon(Icons.contacts, size: 20, color: AppTheme.primaryOrange),
                       tooltip: 'Add from Contacts',
@@ -1596,64 +1588,55 @@ Future<void> _createOrder() async {
                 child: _isLoadingProducts
                     ? const Center(child: CircularProgressIndicator())
                     : _filteredProducts.isEmpty
-                        ? RefreshIndicator(
-                            onRefresh: _refreshProducts,
-                            child: ListView(
-                              physics: const AlwaysScrollableScrollPhysics(),
-                              children: const [
-                                SizedBox(height: 140),
-                                Center(child: Text('No products found')),
-                              ],
-                            ),
-                          )
+                        ? const Center(child: Text('No products found'))
                         : LayoutBuilder(
                             builder: (context, constraints) {
                               final isWide = constraints.maxWidth >= 600;
                               final crossAxisCount = isWide ? 4 : 3;
                               final childAspectRatio = isWide ? 0.60 : 0.70;
                               final hPad = isWide ? 14.0 : 12.0;
-                              return RefreshIndicator(
-                                onRefresh: _refreshProducts,
-                                child: GridView.builder(
-                                  controller: _productsScrollController,
-                                  physics: const AlwaysScrollableScrollPhysics(),
-                                  padding: EdgeInsets.symmetric(horizontal: hPad),
-                                  gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-                                    crossAxisCount: crossAxisCount,
-                                    childAspectRatio: childAspectRatio,
-                                    crossAxisSpacing: 8,
-                                    mainAxisSpacing: 8,
-                                  ),
-                                  itemCount: _visibleProducts.length + (_hasMoreProducts ? 1 : 0),
-                                  itemBuilder: (context, index) {
-                                    if (index >= _visibleProducts.length) {
-                                      return Container(
-                                        alignment: Alignment.center,
-                                        decoration: BoxDecoration(
-                                          color: Colors.grey.shade50,
-                                          borderRadius: BorderRadius.circular(10),
-                                          border: Border.all(color: Colors.grey.shade200),
-                                        ),
-                                        child: const Column(
-                                          mainAxisAlignment: MainAxisAlignment.center,
-                                          children: [
-                                            SizedBox(
-                                              height: 22,
-                                              width: 22,
-                                              child: CircularProgressIndicator(strokeWidth: 2),
-                                            ),
-                                            SizedBox(height: 8),
-                                            Text(
-                                              'Loading more',
-                                              style: TextStyle(fontSize: 11, color: Colors.grey),
-                                            ),
-                                          ],
-                                        ),
-                                      );
-                                    }
-                                    return _buildProductCard(_visibleProducts[index]);
-                                  },
+                              final visibleCount = _visibleProductCount
+                                  .clamp(0, _filteredProducts.length);
+                              final hasMore =
+                                  visibleCount < _filteredProducts.length;
+                              return GridView.builder(
+                                controller: _productsScrollController,
+                                padding: EdgeInsets.symmetric(horizontal: hPad),
+                                gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                                  crossAxisCount: crossAxisCount,
+                                  childAspectRatio: childAspectRatio,
+                                  crossAxisSpacing: 8,
+                                  mainAxisSpacing: 8,
                                 ),
+                                itemCount: visibleCount + (hasMore ? 1 : 0),
+                                itemBuilder: (context, index) {
+                                  if (index >= visibleCount) {
+                                    return Container(
+                                      alignment: Alignment.center,
+                                      decoration: BoxDecoration(
+                                        color: Colors.grey.shade50,
+                                        borderRadius: BorderRadius.circular(10),
+                                        border: Border.all(color: Colors.grey.shade200),
+                                      ),
+                                      child: const Column(
+                                        mainAxisAlignment: MainAxisAlignment.center,
+                                        children: [
+                                          SizedBox(
+                                            height: 22,
+                                            width: 22,
+                                            child: CircularProgressIndicator(strokeWidth: 2),
+                                          ),
+                                          SizedBox(height: 8),
+                                          Text(
+                                            'Loading more',
+                                            style: TextStyle(fontSize: 11, color: Colors.grey),
+                                          ),
+                                        ],
+                                      ),
+                                    );
+                                  }
+                                  return _buildProductCard(_filteredProducts[index]);
+                                },
                               );
                             },
                           ),
@@ -1685,4 +1668,16 @@ Future<void> _createOrder() async {
       ),
     );
   }
+}
+
+class _BillingPriceDetails {
+  const _BillingPriceDetails({
+    required this.price,
+    required this.taxRate,
+    required this.currencyCode,
+  });
+
+  final double price;
+  final double taxRate;
+  final String currencyCode;
 }
