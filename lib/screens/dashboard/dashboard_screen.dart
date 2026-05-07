@@ -166,7 +166,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
             child: _buildKpiCard(
               title: "Today's Sales",
               value: '${_todaySales.toStringAsFixed(2)}',
-              icon: Icons.currency_rupee,
+              text: 'Rs',
               color: AppTheme.primaryOrange,
             ),
           ),
@@ -191,7 +191,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
             child: _buildKpiCard(
               title: "Total Bills",
               value: '${_pendingBillsTotal.toStringAsFixed(2)}',
-              icon: Icons.currency_rupee,
+              text: 'Rs',
               color: Colors.red.shade400,
             ),
           ),
@@ -353,7 +353,8 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
   Widget _buildKpiCard({
     required String title,
     required String value,
-    required IconData icon,
+    IconData? icon,
+    String? text,
     required Color color,
   }) {
     return Container(

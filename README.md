@@ -7,11 +7,15 @@ This repository is structured as a Flutter application with persistent local sto
 ## Table of Contents
 
 - [Overview](#overview)
+- [Order Numbering Schemes](#order-numbering-schemes)
+- [Receipt System](#receipt-system)
 - [Current Capabilities](#current-capabilities)
 - [Technology Stack](#technology-stack)
 - [Architecture Summary](#architecture-summary)
 - [Project Structure](#project-structure)
 - [Application Flow](#application-flow)
+- [The Billing Workflow](#the-billing-workflow)
+- [The Sales Orders Workflow](#the-sales-orders-workflow)
 - [Getting Started](#getting-started)
 - [Configuration](#configuration)
 - [API Integration](#api-integration)
@@ -140,25 +144,61 @@ The app starts on a login screen, allows a user to choose a company from the con
 - `flutter_lints`
 - `flutter_launcher_icons`
 
-## Architecture Summary
+## Order Numbering Schemes
 
-The app follows a fairly standard Flutter layered structure:
+The system uses **two distinct order numbering schemes** to differentiate retail transactions from formal sales orders:
 
-- `screens/` holds UI pages and feature flows
-- `services/` holds API, auth, persistence, session, and scanner logic
-- `models/` holds app entities and generated serialization/adapters
-- `providers/` holds app-wide state containers
-- `theme/` centralizes theming
-- `utils/` stores constants and shared configuration
+### Retail / Billing Orders (`ORD-`)
+- Generated during **billing/checkout** in the billing and payment screens  
+- Format: `ORD-YYYYMMDD-000001` (incremental daily counter)  
+- Also used as: `ORD-YYYYMMDD-TIMEOUT-00000` (timeout fallback)  
+- Used for: Daily retail sales, walk-in customer purchases, cashier transactions  
+- Location: `lib/screens/payment/payment_screen.dart`, `lib/models/order.dart`
 
-At runtime:
+### Sales Orders (`SRO-`)
+- Generated in the **Sales Orders** workflow (`lib/screens/sales orders/salesorders.dart`)  
+- Format: `SRO-YYYYMMDD-000001` (incremental daily counter)  
+- Timeout fallback: `SRO-YYYYMMDD-TIMEOUT-00000`  
+- Used for: Customer quotations, bulk orders, B2B sales, delayed fulfillment  
+- Automatically converts the standard `ORD-` prefix from `Order.generateOrderNumber()` to `SRO-`
 
-1. Flutter initializes Hive and app services in `main.dart`
-2. `DatabaseService.init()` opens all Hive boxes and seeds products if needed
-3. `AuthService.init()` restores a stored user session
-4. `ApiService.init()` prepares Dio and session header behavior
-5. `SessionService` starts inactivity monitoring
-6. `MaterialApp` launches at `/login`
+**Rationale**: Keeping these separate enables businesses to track formal sales proposals distinct from immediate cash sales, simplifies accounting, and supports different fulfillment workflows.
+
+## Receipt System
+
+The receipt system was redesigned for a professional POS printing experience:
+
+### Screen Redesign (`lib/screens/receipt/receipt_screen.dart`)
+- **Dark-themed app bar** contrasting with white receipt card  
+- **Professional layout**: Header → Store Info → Transaction Info → Items Table → Totals → Payment Details → Footer  
+- **Paid status badge** with green checkmark  
+- **Gradient dashed dividers** resembling real thermal receipt paper  
+- **Itemized table** with proper column alignment (Item | Qty | Amount)  
+- **Clear section hierarchy** with appropriate typography and spacing  
+- **Receipt width**: 280 logical pixels (~80mm thermal roll)
+
+### Direct Printing
+- **Previously**: Print button opened an intermediate `ReceiptPrintScreen` page  
+- **Now**: Print button **directly** invokes the system print dialog — no intermediate page  
+- Uses `printing` package for cross-platform printing  
+- PDF preview available before printing  
+- Printer selection handled natively by the OS
+
+### PDF Generation
+- Shared PDF generation logic between display and print flows  
+- `lib/screens/receipt/receipt_screen.dart` includes `_buildPdf()` method  
+- Uses `pdf: ^3.10.0` and `printing: ^5.11.0`  
+- Standardized layout across display and physical print
+
+### Receipt Content
+- Store name, address, phone, GSTIN  
+- Order number, date/time, cashier name  
+- Full item list with quantities and line totals  
+- Subtotal, tax (18%), grand total clearly separated  
+- Payment method and change (if applicable)  
+- Thank-you message with footer  
+
+
 
 ## Project Structure
 
@@ -518,38 +558,142 @@ Scanner-related implementation and setup are documented separately:
 - `lib/screens/camera_scanner/camera_scanner_screen.dart`
 - `lib/screens/billing/scanner_selection_dialog.dart`
 
+## The Billing Workflow
+
+The retail billing flow (ORD- orders) progresses as follows:
+
+1. **Billing Screen** (`lib/screens/billing/billing_screen.dart`)
+   - Browse products by category or search
+   - Scan barcodes via camera or hardware scanner
+   - Real-time stock and pricing checks against local Hive cache
+   - Add/remove items, adjust quantities
+   - Cart summary (subtotal, tax, total) updated in real-time
+
+2. **Payment Screen** (`lib/screens/payment/payment_screen.dart`)
+   - Review final amounts
+   - Select payment method (Cash / Card / Digital Wallet)
+   - Calculate change for cash payments
+   - Generate `ORD-XXXXXX` order number via `Order.generateOrderNumber()`
+   - Save order to local `orders` Hive box
+   - Navigate to receipt screen
+
+3. **Receipt Screen** (`lib/screens/receipt/receipt_screen.dart`)
+   - Display professional receipt UI with all order details
+   - **Direct Print button** → invokes system print dialog (no intermediate page)
+   - Return to dashboard or create new order
+
+Key classes:
+- `BillingScreen` – Main billing UI with product grid and cart
+- `CartItem` – Cart line item with quantity, discount, line total
+- `Product` – Product entity with live pricing from backend
+- `DatabaseService` – Hive persistence layer
+
+## The Sales Orders Workflow
+
+The sales orders flow (SRO- orders) handles customer-facing orders and quotations:
+
+1. **Sales Orders Screen** (`lib/screens/sales orders/salesorders.dart`)
+   - Select member/customer from stored database
+   - Add items to cart (identical UI/UX to billing)
+   - Real-time pricing fetched from backend API with local fallback
+
+2. **Order Number Generation**
+   - Calls `Order.generateOrderNumber()` → gets `ORD-XXXXXX`  
+   - **Converts to `SRO-`** by prefix replacement at line 925-928
+   - Stores as `Order` with `SRO-XXXXXXXX` format
+   - Timeout fallback generates `SRO-YYYYMMDD-TIMEOUT-00000` directly
+
+3. **Payment and Completion**
+   - Process payment (immediate or on-account)
+   - Save order to local `orders` box with `SRO-` prefix
+   - Display receipt with direct print option
+
+**Code Location**: Order number conversion in `lib/screens/sales orders/salesorders.dart` lines 925-928:
+```dart
+if (orderNumber.startsWith('ORD-')) {
+  orderNumber = 'SRO' + orderNumber.substring(3);
+}
+```
+
 ## Build, Code Generation, and Packaging
+
+### Prerequisites
+
+```bash
+# Verify Flutter installation
+flutter doctor
+
+# Install dependencies
+flutter pub get
+
+# Generate code (Hive adapters, JSON serializers)
+dart run build_runner build --delete-conflicting-outputs
+```
+
+If you modify any models in `lib/models/*.dart` or files using `json_annotation`, you **must** regenerate code.
 
 ### Debug Build
 
 ```bash
 flutter build apk --debug
+flutter build ios --debug
+flutter build web --debug
 ```
 
 ### Release Build
 
 ```bash
+# Android APK (for testing)
 flutter build apk --release
+
+# Android AppBundle (for Google Play)
 flutter build appbundle --release
+
+# iOS
+flutter build ios --release
+
+# Windows (desktop)
 flutter build windows --release
+
+# Web
 flutter build web --release
+
+# Linux
+flutter build linux --release
+
+# macOS
+flutter build macos --release
 ```
 
-### iOS
+### Code Generation
+
+The project uses `build_runner` for code generation:
+
+| Generator | Purpose | Output |
+|-----------|---------|--------|
+| `hive_generator` | Hive TypeAdapters | `*.g.dart` files |
+| `json_serializable` | JSON `fromJson`/`toJson` | `*.g.dart` files |
+
+After modifying models:
 
 ```bash
-flutter build ios --release
+dart run build_runner build --delete-conflicting-outputs
+```
+
+For development watch mode:
+
+```bash
+dart run build_runner watch --delete-conflicting-outputs
 ```
 
 ### App Icons
 
-Launcher icon configuration is already present in `pubspec.yaml` via `flutter_launcher_icons`.
-
-To regenerate icons:
+Launcher icon configuration is in `pubspec.yaml` via `flutter_launcher_icons`. To regenerate:
 
 ```bash
 dart run flutter_launcher_icons
 ```
+
 
 ## Routes and Screens
 
@@ -765,16 +909,31 @@ flutter build apk --release
 - `lib/services/api_service.dart`
 - `lib/services/database_service.dart`
 - `lib/services/auth_service.dart`
+- `lib/models/order.dart` – Order entity, ORD-/SRO- generation
+- `lib/models/cart_item.dart` – Cart item, line totals, discounts
 - `lib/screens/login_screen.dart`
+- `lib/screens/billing/billing_screen.dart` – Retail billing (ORD-)
+- `lib/screens/payment/payment_screen.dart` – Payment, order creation
+- `lib/screens/receipt/receipt_screen.dart` – Receipt display, direct print
+- `lib/screens/sales orders/salesorders.dart` – Sales Orders (SRO-)
 - `pubspec.yaml`
 - `SCANNER_IMPLEMENTATION.md`
 - `SCANNER_PERMISSIONS.md`
 
 ### Project Metadata
 
-- App name: `Focus SwiftBill`
-- Package name: `focus_swiftbill`
-- Version: `1.0.0+1`
-- Flutter assets:
+- **App Name**: `Focus SwiftBill`
+- **Package Name**: `focus_swiftbill`
+- **Version**: `1.0.0+1`
+- **Flutter Version**: Compatible with Dart `^3.10.8`
+- **Assets**:
   - `assets/focusswiftbill.jpeg`
   - `assets/logo2-removebg-preview.png`
+
+### Order Number Formats
+
+| Type | Prefix | Example | Generated By |
+|------|--------|---------|--------------|
+| Retail Billing | `ORD-` | `ORD-20260507-000123` | `payment/payment_screen.dart` |
+| Sales Orders | `SRO-` | `SRO-20260507-000456` | `sales orders/salesorders.dart` |
+| Timeout Fallback | `ORD-/SRO-` | `ORD-20260507-TIMEOUT-01234` | Timeout handlers |

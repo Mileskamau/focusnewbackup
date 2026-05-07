@@ -923,11 +923,15 @@ class _BillingScreenState extends State<BillingScreen> {
       String orderNumber;
       try {
         orderNumber = await Order.generateOrderNumber().timeout(const Duration(seconds: 10));
+        // Override ORD prefix with SRO for sales orders
+        if (orderNumber.startsWith('ORD-')) {
+          orderNumber = 'SRO' + orderNumber.substring(3);
+        }
       } on TimeoutException {
         final now = DateTime.now();
         final dateKey = DateFormat('yyyyMMdd').format(now);
         final timestamp = now.millisecondsSinceEpoch % 100000;
-        orderNumber = 'ORD-$dateKey-TIMEOUT-${timestamp.toString().padLeft(5, '0')}';
+        orderNumber = 'SRO-$dateKey-TIMEOUT-${timestamp.toString().padLeft(5, '0')}';
       }
 
       final userId = _auth.getUserId();
@@ -984,7 +988,12 @@ class _BillingScreenState extends State<BillingScreen> {
         );
         Provider.of<OrdersProvider>(context, listen: false).refreshOrders();
         Provider.of<NavigationProvider>(context, listen: false).setIndex(2);
-        Navigator.pop(context);
+        Navigator.pushNamedAndRemoveUntil(
+          context,
+          '/main',
+          (route) => false,
+          arguments: 2,
+        );
       }
     } catch (e) {
       if (mounted) {
@@ -1414,20 +1423,40 @@ class _BillingScreenState extends State<BillingScreen> {
     );
   }
 
+  void _goToDashboard() {
+    final navProvider =
+        Provider.of<NavigationProvider>(context, listen: false);
+    navProvider.setIndex(0);
+    Navigator.pushNamedAndRemoveUntil(
+      context,
+      '/main',
+      (route) => false,
+      arguments: 0,
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final navigationProvider = Provider.of<NavigationProvider>(context);
     final isStandalone = ModalRoute.of(context)?.settings.name == '/salesorders';
 
-    return Focus(
-      autofocus: true,
-      onKeyEvent: (FocusNode node, KeyEvent event) {
-        if (_activeScanner != null && _activeScanner != ScannerService.camera) {
-          _scannerService.handleKeyEvent(event);
-        }
-        return KeyEventResult.handled;
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, result) {
+        if (didPop) return;
+        _goToDashboard();
       },
-      child: Scaffold(
+      child: Focus(
+        autofocus: true,
+        onKeyEvent: (FocusNode node, KeyEvent event) {
+          if (_activeScanner != null &&
+              _activeScanner != ScannerService.camera) {
+            _scannerService.handleKeyEvent(event);
+            return KeyEventResult.handled;
+          }
+          return KeyEventResult.ignored;
+        },
+        child: Scaffold(
         body: SafeArea(
           child: Column(
             children: [
@@ -1665,6 +1694,7 @@ class _BillingScreenState extends State<BillingScreen> {
                 ],
               )
             : null,
+        ),
       ),
     );
   }

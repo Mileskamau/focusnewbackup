@@ -84,13 +84,13 @@ class _FocusSupermarketAppState extends State<FocusSupermarketApp> with WidgetsB
     return PopScope(
       canPop: false,
       onPopInvokedWithResult: (didPop, result) {
-        if (!didPop) {
-          if (navigatorKey.currentState != null && 
-              navigatorKey.currentState!.canPop()) {
-            navigatorKey.currentState!.maybePop();
-          } else {
-            navigatorKey.currentState?.pushNamedAndRemoveUntil('/main', (route) => false);
-          }
+        if (didPop) return;
+        final nav = navigatorKey.currentState;
+        if (nav == null) return;
+        if (nav.canPop()) {
+          nav.pop();
+        } else {
+          nav.pushNamedAndRemoveUntil('/main', (route) => false);
         }
       },
       child: child,
@@ -116,26 +116,18 @@ class _FocusSupermarketAppState extends State<FocusSupermarketApp> with WidgetsB
           '/login': (context) => _withHomeBackButton(const LoginScreen(), '/login'),
           '/billing': (context) => _withHomeBackButton(const BillingHubScreen(), '/billing'),
           '/pending_bills': (context) => const PendingBillsScreen(),
-          '/main': (context) {
-            final args = ModalRoute.of(context)!.settings.arguments as int?;
-            if (args != null) {
-              WidgetsBinding.instance.addPostFrameCallback((_) {
-                Provider.of<NavigationProvider>(context, listen: false).setIndex(args);
-              });
-            }
-            return const MainScreen();   // ✅ const works after full restart
-          },
-          '/payment': (context) => _withHomeBackButton(const PaymentScreen(), '/payment'),
+          '/main': (context) => const MainScreen(),
+          '/payment': (context) => const PaymentScreen(),
           '/receipt': (context) {
             final args = ModalRoute.of(context)!.settings.arguments as Map?;
-            return _withHomeBackButton(ReceiptScreen(order: args?['order'], change: args?['change'] ?? 0), '/receipt');
+            return ReceiptScreen(order: args?['order'], change: args?['change'] ?? 0);
           },
           '/camera_scanner': (context) {
             final args = ModalRoute.of(context)!.settings.arguments as Map?;
             return _withHomeBackButton(CameraScannerScreen(title: args?['title'] as String?), '/camera_scanner');
           },
           '/view_all_billings': (context) => _withHomeBackButton(const ViewAllBillingsScreen(), '/view_all_billings'),
-          '/salesorders': (context) => _withHomeBackButton(const BillingScreen(), '/salesorders'),
+          '/salesorders': (context) => const BillingScreen(),
           '/settings': (context) => _withHomeBackButton(const AdminSettingScreen(), '/settings'),
         },
       ),
